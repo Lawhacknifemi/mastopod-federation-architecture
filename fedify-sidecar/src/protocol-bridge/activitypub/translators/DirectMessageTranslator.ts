@@ -88,8 +88,8 @@ export class DirectMessageTranslator implements ProtocolTranslator<unknown> {
       const activity = parsed.data;
       const toList_ = toList(activity.to);
 
-      // Must have at least one recipient, none of them public
-      return toList_.length >= 1 && toList_.every((r) => r !== PUBLIC_AUDIENCE);
+      // Must have exactly one recipient, and it must not be public
+      return toList_.length === 1 && toList_.every((r) => r !== PUBLIC_AUDIENCE);
     } catch {
       return false;
     }
@@ -117,7 +117,8 @@ export async function translateDirectMessageActivity(
   const activity = parsed.data;
   const toRecipients = toList(activity.to).filter((r) => r !== PUBLIC_AUDIENCE);
 
-  if (toRecipients.length === 0) return null;
+  // Group DMs (multiple recipients) are not supported as AP inbound
+  if (toRecipients.length !== 1) return null;
 
   const now = (ctx.now ?? (() => new Date()))();
   const actorId = getActorId(activity.actor);
@@ -149,7 +150,7 @@ export async function translateDirectMessageActivity(
   const { plaintext, blocks: _blocks } = htmlToCanonicalBlocks(sanitizedContent);
   const text = plaintext.slice(0, MAX_TEXT_LEN);
 
-  const objectId = activity.object?.id ?? activity.id;
+  const objectId = activity.object?.id;
   const messageId = objectId ?? `${actorId}#dm-${Date.now()}`;
 
   const attachments = buildAttachments(activity.object?.["attachment"], messageId);
