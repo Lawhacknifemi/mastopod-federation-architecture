@@ -4,7 +4,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 AP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 WORK_ROOT=$(CDPATH= cd -- "$AP_ROOT/.." && pwd)
-FEDIFY_ROOT="$WORK_ROOT/mastopod-federation-architecture/fedify-sidecar"
+FEDIFY_ROOT="$WORK_ROOT"
+AP_ROOT=$(CDPATH= cd -- "$WORK_ROOT/../../activitypods" && pwd)
 
 PID_DIR="$AP_ROOT/.pids"
 

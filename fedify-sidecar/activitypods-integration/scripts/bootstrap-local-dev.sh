@@ -4,8 +4,9 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 AP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 WORK_ROOT=$(CDPATH= cd -- "$AP_ROOT/.." && pwd)
-FEDIFY_ROOT="$WORK_ROOT/mastopod-federation-architecture/fedify-sidecar"
-MEDIA_ROOT="$WORK_ROOT/mastopod-federation-architecture/media-pipeline-sidecar"
+FEDIFY_ROOT="$WORK_ROOT"
+AP_ROOT=$(CDPATH= cd -- "$WORK_ROOT/../../activitypods" && pwd)
+MEDIA_ROOT="$WORK_ROOT/../media-pipeline-sidecar"
 
 log() {
   printf '%s\n' "[bootstrap] $*"
@@ -124,7 +125,11 @@ main() {
     exit 1
   fi
 
-  ensure_colima
+  if docker info >/dev/null 2>&1; then
+    log "Docker daemon is already running (via OrbStack/Docker Desktop)"
+  else
+    ensure_colima
+  fi
 
   log "starting ActivityPods compose dependencies"
   docker compose -f "$AP_ROOT/pod-provider/docker-compose.yml" up -d

@@ -41,6 +41,14 @@ describe("normalizeAndDedupeOutboundTargets", () => {
     expect(result.invalidTargetCount).toBe(1);
   });
 
+  it("returns empty target results when remoteTargets is empty", () => {
+    const result = normalizeAndDedupeOutboundTargets([], { maxTargetsPerRequest: 100 });
+    expect(result.targets).toEqual([]);
+    expect(result.inputTargetCount).toBe(0);
+    expect(result.duplicateTargetCount).toBe(0);
+    expect(result.invalidTargetCount).toBe(0);
+  });
+
   it("rejects requests that exceed the configured maximum target count", () => {
     expect(() =>
       normalizeAndDedupeOutboundTargets(

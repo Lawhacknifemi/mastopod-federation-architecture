@@ -56,11 +56,12 @@ export function normalizeAndDedupeOutboundTargets(
   }
 
   if (remoteTargets.length === 0) {
-    throw new OutboundWebhookValidationError(
-      "OUTBOUND_TARGETS_EMPTY",
-      400,
-      "remoteTargets must contain at least one delivery target.",
-    );
+    return {
+      targets: [],
+      inputTargetCount: 0,
+      duplicateTargetCount: 0,
+      invalidTargetCount: 0,
+    };
   }
 
   if (remoteTargets.length > config.maxTargetsPerRequest) {

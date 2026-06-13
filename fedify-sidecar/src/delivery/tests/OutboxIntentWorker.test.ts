@@ -181,4 +181,23 @@ describe("OutboxIntentWorker", () => {
     expect(redpanda.publishToStream1).toHaveBeenCalledTimes(1);
     expect(queue.enqueueOutboundBatchForIntent).toHaveBeenCalledTimes(1);
   });
+
+  it("processes public activity with empty targets list, publishing event log and marking completed", async () => {
+    const queue = makeQueue();
+    const redpanda = makeRedpanda();
+    const worker = new TestOutboxIntentWorker(queue, redpanda, makeConfig());
+    const intent = makeIntent({
+      targets: [],
+    });
+
+    await worker.runIntent("msg-005", intent);
+
+    expect(redpanda.publishToStream1).toHaveBeenCalledTimes(1);
+    expect(queue.markOutboxIntentEventLogPublished).toHaveBeenCalledWith(intent.intentId);
+    expect(queue.enqueueOutboundBatchForIntent).toHaveBeenCalledWith(intent.intentId, []);
+    expect(queue.markOutboxIntentCompleted).toHaveBeenCalledWith(intent.intentId);
+    expect(queue.ack).toHaveBeenCalledWith("outbox_intent", "msg-005");
+    expect(queue.enqueueOutboxIntent).not.toHaveBeenCalled();
+    expect(queue.moveToDlq).not.toHaveBeenCalled();
+  });
 });

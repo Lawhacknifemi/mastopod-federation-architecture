@@ -123,9 +123,11 @@ export const PublicContentMapping = {
       embedding: {
         type: 'knn_vector',
         dimension: 1024,
-        space_type: 'cosinesimil',
-        mode: 'on_disk',
-        compression_level: '16x'
+        method: {
+          name: 'hnsw',
+          space_type: 'cosinesimil',
+          engine: 'nmslib'
+        }
       },
       embeddingStatus: { type: 'keyword' },
       embeddingUpdatedAt: {

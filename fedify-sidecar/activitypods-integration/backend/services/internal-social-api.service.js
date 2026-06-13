@@ -93,13 +93,29 @@ module.exports = {
             ''
           ).trim();
           const token = this.parseBearerToken(authHeader);
-          if (!this.safeTokenEquals(bearerToken, token)) {
+          if (!token) {
             throw new WebErrors.UnAuthorizedError(
               WebErrors.ERR_INVALID_TOKEN,
               null,
               'Unauthorized',
             );
           }
+
+          if (this.safeTokenEquals(bearerToken, token)) {
+            ctx.meta.isMasterCall = true;
+          } else {
+            const actorUri = this.verifyUserToken(token, bearerToken);
+            if (!actorUri) {
+              throw new WebErrors.UnAuthorizedError(
+                WebErrors.ERR_INVALID_TOKEN,
+                null,
+                'Unauthorized',
+              );
+            }
+            ctx.meta.isMasterCall = false;
+            ctx.meta.authenticatedActorUri = actorUri;
+          }
+
           ctx.meta.$responseHeaders = {
             ...(ctx.meta.$responseHeaders || {}),
             'Cache-Control': 'no-store',
@@ -133,7 +149,12 @@ module.exports = {
     postToOutbox: {
       async handler(ctx) {
         const actorUri = this.requireString(ctx.params?.actorUri, 'actorUri');
+        ctx.meta.dataset = this.getDataset(actorUri);
         const activity = ctx.params?.activity;
+
+        if (!ctx.meta.isMasterCall && ctx.meta.authenticatedActorUri !== actorUri) {
+          throw new MoleculerError('Forbidden: Token does not match requested actor', 403, 'FORBIDDEN');
+        }
 
         if (!activity || typeof activity !== 'object' || Array.isArray(activity)) {
           throw new MoleculerError('activity must be an object', 400, 'INVALID_INPUT');
@@ -180,6 +201,12 @@ module.exports = {
           ctx.params?.actorUri ?? ctx.meta.queryString?.actorUri,
           'actorUri',
         );
+        ctx.meta.dataset = this.getDataset(actorUri);
+
+        if (!ctx.meta.isMasterCall && ctx.meta.authenticatedActorUri !== actorUri) {
+          throw new MoleculerError('Forbidden: Token does not match requested actor', 403, 'FORBIDDEN');
+        }
+
         this.validateHttpUrl(actorUri, 'actorUri');
 
         const actor = await ctx.call('activitypub.actor.get', {
@@ -206,6 +233,12 @@ module.exports = {
           ctx.params?.actorUri ?? ctx.meta.queryString?.actorUri,
           'actorUri',
         );
+        ctx.meta.dataset = this.getDataset(actorUri);
+
+        if (!ctx.meta.isMasterCall && ctx.meta.authenticatedActorUri !== actorUri) {
+          throw new MoleculerError('Forbidden: Token does not match requested actor', 403, 'FORBIDDEN');
+        }
+
         this.validateHttpUrl(actorUri, 'actorUri');
 
         const page = Math.max(1, parseInt(ctx.params?.page ?? ctx.meta.queryString?.page ?? '1', 10) || 1);
@@ -247,6 +280,12 @@ module.exports = {
           ctx.params?.actorUri ?? ctx.meta.queryString?.actorUri,
           'actorUri',
         );
+        ctx.meta.dataset = this.getDataset(actorUri);
+
+        if (!ctx.meta.isMasterCall && ctx.meta.authenticatedActorUri !== actorUri) {
+          throw new MoleculerError('Forbidden: Token does not match requested actor', 403, 'FORBIDDEN');
+        }
+
         this.validateHttpUrl(actorUri, 'actorUri');
 
         const page = Math.max(1, parseInt(ctx.params?.page ?? ctx.meta.queryString?.page ?? '1', 10) || 1);
@@ -287,6 +326,12 @@ module.exports = {
     updateProfile: {
       async handler(ctx) {
         const actorUri = this.requireString(ctx.params?.actorUri, 'actorUri');
+        ctx.meta.dataset = this.getDataset(actorUri);
+
+        if (!ctx.meta.isMasterCall && ctx.meta.authenticatedActorUri !== actorUri) {
+          throw new MoleculerError('Forbidden: Token does not match requested actor', 403, 'FORBIDDEN');
+        }
+
         this.validateHttpUrl(actorUri, 'actorUri');
 
         const displayName = typeof ctx.params?.displayName === 'string'
@@ -339,6 +384,10 @@ module.exports = {
     // =========================================================================
     verifyPassword: {
       async handler(ctx) {
+        if (!ctx.meta.isMasterCall) {
+          throw new MoleculerError('Forbidden: Requires master token authentication', 403, 'FORBIDDEN');
+        }
+
         const canonicalAccountId = this.requireString(
           ctx.params?.canonicalAccountId,
           'canonicalAccountId',
@@ -359,8 +408,8 @@ module.exports = {
 
         if (!account) {
           this.dummyPasswordCheck(password);
-          ctx.meta.$statusCode = 404;
-          return { ok: false, reason: 'account_not_found' };
+          ctx.meta.$statusCode = 401;
+          return { ok: false, reason: 'invalid_credentials' };
         }
 
         // auth.account.verify returns the account on success, throws on failure
@@ -371,11 +420,13 @@ module.exports = {
           });
         } catch {
           ctx.meta.$statusCode = 401;
-          return { ok: false, reason: 'invalid_password' };
+          return { ok: false, reason: 'invalid_credentials' };
         }
 
+        const token = this.generateUserToken(canonicalAccountId, this.settings.auth.bearerToken);
+
         ctx.meta.$statusCode = 200;
-        return { ok: true, scope: 'full' };
+        return { ok: true, scope: 'full', token };
       },
     },
   },
@@ -385,6 +436,52 @@ module.exports = {
     // -------------------------------------------------------------------------
     // Auth helpers
     // -------------------------------------------------------------------------
+
+    generateUserToken(actorUri, secretKey) {
+      const exp = Date.now() + 24 * 60 * 60 * 1000;
+      const payload = JSON.stringify({ actorUri, exp });
+      const base64Payload = Buffer.from(payload).toString('base64url');
+      const signature = crypto
+        .createHmac('sha256', secretKey)
+        .update(base64Payload)
+        .digest('base64url');
+      return `${base64Payload}.${signature}`;
+    },
+
+    verifyUserToken(token, secretKey) {
+      try {
+        const parts = token.split('.');
+        if (parts.length !== 2) return null;
+        const [base64Payload, signature] = parts;
+        
+        const expectedSignature = crypto
+          .createHmac('sha256', secretKey)
+          .update(base64Payload)
+          .digest('base64url');
+        
+        const sigBuffer = Buffer.from(signature, 'utf8');
+        const expBuffer = Buffer.from(expectedSignature, 'utf8');
+        
+        if (sigBuffer.length !== expBuffer.length || !crypto.timingSafeEqual(sigBuffer, expBuffer)) {
+          return null;
+        }
+        
+        const payloadStr = Buffer.from(base64Payload, 'base64url').toString('utf8');
+        const payload = JSON.parse(payloadStr);
+        
+        if (!payload.actorUri || typeof payload.exp !== 'number') {
+          return null;
+        }
+        
+        if (payload.exp < Date.now()) {
+          return null;
+        }
+        
+        return payload.actorUri;
+      } catch (err) {
+        return null;
+      }
+    },
 
     parseBearerToken(authHeader) {
       if (!authHeader || typeof authHeader !== 'string') return null;

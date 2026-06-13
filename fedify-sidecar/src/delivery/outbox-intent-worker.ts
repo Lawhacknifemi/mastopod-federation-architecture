@@ -149,12 +149,7 @@ export class OutboxIntentWorker {
         enrichedTargets,
         { maxTargetsPerRequest: Math.max(enrichedTargets.length, 1) },
       );
-      if (normalizedTargets.targets.length === 0) {
-        throw new OutboxIntentProcessingError(
-          "Outbox intent does not contain any valid delivery targets",
-          true,
-        );
-      }
+
 
       if (normalizedTargets.invalidTargetCount > 0 || normalizedTargets.duplicateTargetCount > 0) {
         logger.warn("Outbox intent targets required runtime normalization", {

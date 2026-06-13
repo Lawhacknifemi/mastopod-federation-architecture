@@ -196,6 +196,7 @@ module.exports = {
         activity: event.activity,
         bridge: event.bridge || undefined,
         remoteTargets: event.deliveryTargets,  // sidecar validates body.remoteTargets
+        meta: event.meta,
       };
 
       const headers = {

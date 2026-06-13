@@ -194,7 +194,7 @@ export const HydrationItemInputSchema = z.object({
 
 export const HydrationRequestSchema = z.object({
   viewerId: ViewerIdSchema.optional(),
-  items: z.array(HydrationItemInputSchema).min(1).max(100),
+  items: z.array(HydrationItemInputSchema).max(100),
   shape: HydrationShapeSchema.default("card"),
 });
 

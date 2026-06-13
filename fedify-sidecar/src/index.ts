@@ -245,6 +245,7 @@ import { QdrantHydrator } from "./feed/QdrantHydrator.js";
 import { QdrantDocumentStore } from "./feed/QdrantDocumentStore.js";
 import type { FeedDefinition } from "./feed/contracts.js";
 import { registerFeedFastifyRoutes, attachFeedStreamWebSocket } from "./feed/fastify-routes.js";
+import { registerPublicFeedRoutes } from "./feed/public-routes.js";
 import { DurableStreamSubscriptionService, buildCapabilityLookup } from "./feed/DurableStreamSubscriptionService.js";
 import { FeedStreamKafkaConsumer } from "./feed/FeedStreamKafkaConsumer.js";
 import { UnifiedFeedBridge } from "./feed/UnifiedFeedBridge.js";
@@ -2190,6 +2191,11 @@ async function main() {
       streamSubscriptionService,
       capabilityGate,
       checkStreamEntitlement,
+    });
+
+    registerPublicFeedRoutes(app, {
+      feedService,
+      hydrationService,
     });
 
     const enableFep3ab2Streaming = (process.env["ENABLE_FEP_3AB2_STREAMING"] ?? "true") !== "false";
