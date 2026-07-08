@@ -68,9 +68,10 @@ services:
     container_name: fedify-sidecar
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${PORT:-8080}:8080"
     environment:
-      - NODE_ENV=production
+      - NODE_ENV=${NODE_ENV:-development}
+      - REDPANDA_ENFORCE_TOPIC_GOVERNANCE=${REDPANDA_ENFORCE_TOPIC_GOVERNANCE:-false}
       - PORT=8080
       - HOST=0.0.0.0
       - VERSION=5.0.0
@@ -79,6 +80,7 @@ services:
       
       # Redis - work queues and control data
       - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://sidecar_user:sidecar_password@postgres:5432/fedify_sidecar
       - INBOUND_STREAM_KEY=ap:queue:inbound:v1
       - OUTBOUND_STREAM_KEY=ap:queue:outbound:v1
       - DLQ_STREAM_KEY=ap:queue:dlq:v1
@@ -95,9 +97,10 @@ services:
       - CONSUMER_GROUP_INDEXER=sidecar-indexer
       
       # ActivityPods - signing API (keys never leave)
-      - ACTIVITYPODS_URL=${ACTIVITYPODS_URL:-http://activitypods:3000}
+      - ACTIVITYPODS_URL=${ACTIVITYPODS_URL:-http://host.docker.internal:3000}
       - ACTIVITYPODS_TOKEN=${ACTIVITYPODS_TOKEN:-}
-      - SIGNING_API_URL=http://activitypods:3000/api/internal/signatures/batch
+      - SIDECAR_TOKEN=${SIDECAR_TOKEN:-}
+      - SIGNING_API_URL=http://host.docker.internal:3000/api/internal/signatures/batch
       
       # OpenSearch - activity storage
       - OPENSEARCH_NODE=http://opensearch:9200
@@ -117,6 +120,7 @@ services:
       - ENABLE_OUTBOX_INTENT_WORKER=true
       # Required for AP relay subscriptions, Fedify runtime adapter, and origin reconciliation
       - ENABLE_FEDIFY_RUNTIME_INTEGRATION=true
+      - AT_LOCAL_FIXTURE=${AT_LOCAL_FIXTURE:-true}
 
       # AP relay subscription
       # AP_RELAY_ACTOR_URLS: override the default relay list (comma-separated actor URLs).

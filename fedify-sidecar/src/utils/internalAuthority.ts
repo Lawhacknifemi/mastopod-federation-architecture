@@ -1,6 +1,6 @@
 import { isIP } from "node:net";
 
-const loopbackHostnames = new Set(["localhost", "127.0.0.1", "::1"]);
+const loopbackHostnames = new Set(["localhost", "127.0.0.1", "::1", "host.docker.internal"]);
 
 export function isSecureOrTrustedInternalUrl(url: URL): boolean {
   return url.protocol === "https:"

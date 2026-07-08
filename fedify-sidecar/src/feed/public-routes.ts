@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { DefaultPodFeedService } from "./PodFeedService.js";
 import type { DefaultPodHydrationService } from "./PodHydrationService.js";
 import crypto from "node:crypto";
+import { pool } from "../db/postgres.js";
 
 export interface PublicFeedRouteDeps {
   feedService: DefaultPodFeedService;
@@ -329,8 +330,75 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
         mappedItems.push(mapToUnifiedFeedItem(item));
       }
 
+      // Query unsynced posts from local cache database
+      const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
+      let unsyncedItems: any[] = [];
+      try {
+        const { rows } = await pool.query(
+          `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, created_at
+           FROM local_cache_posts
+           WHERE synced_to_fuseki = FALSE
+           ORDER BY created_at DESC`
+        );
+        
+        const rawUnsynced = rows.map((row: any) => {
+          const authorName = row.actor_uri.split("/").pop() || "user";
+          const objectUri = `${activityPodsUrl}/${authorName}/data/${row.post_type === "article" ? "article" : "note"}/${row.id}`;
+          
+          return {
+            id: objectUri,
+            content: row.content,
+            postType: row.post_type,
+            title: row.name || null,
+            summary: row.summary || null,
+            canonicalUrl: objectUri,
+            createdAt: row.created_at.toISOString(),
+            isPublic: true,
+            authorId: null,
+            authorName: authorName,
+            authorWebId: row.actor_uri,
+            authorProviderEndpoint: new URL(row.actor_uri).origin,
+            authorAvatar: null,
+            source: "activitypods",
+            atUri: null,
+            objectUri: objectUri,
+            type: "post",
+            protocolPresence: ["ap", "at"],
+            hashtags: row.hashtags || [],
+            attachments: Array.isArray(row.attachments) ? row.attachments : []
+          };
+        });
+
+        // Filter unsynced items based on hashtag / source query
+        unsyncedItems = rawUnsynced.filter((item: any) => {
+          if (query.hashtag) {
+            const hashtagClean = (query.hashtag as string).toLowerCase().replace(/^#/, "");
+            const tagMatch = item.hashtags.some((h: string) => h.toLowerCase().replace(/^#/, "") === hashtagClean);
+            if (!tagMatch) return false;
+          }
+          return true;
+        });
+      } catch (dbErr) {
+        console.error("Failed to query unsynced posts from DB:", dbErr);
+      }
+
+      // Merge and sort
+      let finalItems = [...unsyncedItems, ...mappedItems];
+      
+      // Deduplicate by objectUri or id
+      const seen = new Set<string>();
+      finalItems = finalItems.filter((item: any) => {
+        const uri = item.objectUri || item.id;
+        if (seen.has(uri)) return false;
+        seen.add(uri);
+        return true;
+      });
+
+      // Sort by createdAt descending
+      finalItems.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
       reply.send({
-        items: mappedItems,
+        items: finalItems,
         nextCursor: skeleton.cursor || null,
         hasMore: !!skeleton.cursor
       });
@@ -614,8 +682,8 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
   });
 
   // POST /at/create-post - Proxy create ActivityPub Note/Article to user's outbox
-  // The sidecar authenticates the caller via its HMAC token, then forwards the
-  // activity to ActivityPods using the trusted internal server token.
+  // The sidecar authenticates the caller via its HMAC token, then caches the post
+  // in PostgreSQL and returns immediately. A background worker periodically syncs it to ActivityPods.
   app.post("/at/create-post", async (req, reply) => {
     const webId = await getAuthedWebId(req);
     if (!webId) {
@@ -632,67 +700,32 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
     }
 
     const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
-    const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
-
-    const tags: any[] = (hashtags as string[]).map((tag: string) => ({
-      type: "Hashtag",
-      name: tag.startsWith("#") ? tag : `#${tag}`,
-      href: `${activityPodsUrl}/tags/${tag.replace(/^#/, "")}`,
-    }));
-
-    const apAttachments: any[] = (attachments as any[]).map((att: any) => ({
-      type: att.type || "Image",
-      mediaType: att.mediaType,
-      url: att.url,
-      name: att.name || undefined,
-    }));
-
-    const activity: any = {
-      "@context": "https://www.w3.org/ns/activitystreams",
-      type: "Create",
-      actor: webId,
-      to: ["https://www.w3.org/ns/activitystreams#Public"],
-      object: {
-        type: postType === "article" ? "Article" : "Note",
-        attributedTo: webId,
-        content: content || "",
-        to: ["https://www.w3.org/ns/activitystreams#Public"],
-        ...(name ? { name } : {}),
-        ...(summary ? { summary } : {}),
-        ...(tags.length > 0 ? { tag: tags } : {}),
-        ...(apAttachments.length > 0 ? { attachment: apAttachments } : {}),
-      },
-    };
+    const postId = crypto.randomUUID();
+    const username = webId.split("/").pop() || "user";
+    const objectUri = `${activityPodsUrl}/${username}/data/${postType === "article" ? "article" : "note"}/${postId}`;
 
     try {
-      // Use the internal social API which accepts the master bearer token.
-      // Body: { actorUri, activity } — ActivityPods posts to the actor's outbox
-      // while enforcing actor ownership server-side.
-      const response = await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${activityPodsToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ actorUri: webId, activity }),
-      });
-
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        console.error("[create-post] Internal social API rejected:", response.status, text);
-        reply.code(response.status >= 400 && response.status < 600 ? response.status : 502)
-          .send({ error: "upstream_error", message: `ActivityPods returned ${response.status}` });
-        return;
-      }
-
-      const resBody = await response.json().catch(() => ({})) as any;
-      const objectVal = resBody.activity?.object;
-      const objectUri = (typeof objectVal === "string" ? objectVal : (objectVal?.id || objectVal?.["@id"])) || resBody.objectUri || null;
+      // Save post metadata to local PG cache
+      await pool.query(
+        `INSERT INTO local_cache_posts (
+          id, actor_uri, content, post_type, name, summary, hashtags, attachments, synced_to_fuseki
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE)`,
+        [
+          postId,
+          webId,
+          content || "",
+          postType,
+          name || null,
+          summary || null,
+          hashtags,
+          JSON.stringify(attachments),
+        ]
+      );
 
       reply.code(201).send({ ok: true, objectUri });
-    } catch (err) {
-      console.error("[create-post] Failed to proxy to internal social API:", err);
-      reply.code(500).send({ error: "internal_error", message: String(err) });
+    } catch (err: any) {
+      console.error("[create-post] Failed to cache post in PostgreSQL:", err);
+      reply.code(500).send({ error: "internal_error", message: `Failed to queue post: ${err.message}` });
     }
   });
 

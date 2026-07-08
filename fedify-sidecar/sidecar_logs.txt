@@ -1,0 +1,40 @@
+{"level":30,"time":"2026-06-14T08:03:46.321Z","service":"fedify-sidecar","version":"5.0.0","msg":"Starting Fedify Sidecar for ActivityPods"}
+{"level":30,"time":"2026-06-14T08:03:46.359Z","service":"fedify-sidecar","version":"5.0.0","msg":"Redis Streams Queue connected"}
+{"level":30,"time":"2026-06-14T08:03:46.359Z","service":"fedify-sidecar","version":"5.0.0","msg":"Redis Streams queue connected"}
+{"level":30,"time":"2026-06-14T08:03:46.359Z","service":"fedify-sidecar","version":"5.0.0","msg":"Signing client initialized"}
+{"level":30,"time":"2026-06-14T08:03:46.364Z","service":"fedify-sidecar","version":"5.0.0","msg":"Remote sharedInbox cache initialized"}
+{"level":30,"time":"2026-06-14T08:03:46.364Z","service":"fedify-sidecar","version":"5.0.0","msg":"Inbound idempotency guard initialized"}
+{"level":30,"time":"2026-06-14T08:03:46.364Z","service":"fedify-sidecar","version":"5.0.0","msg":"Provider-level Announce aggregator initialized"}
+{"level":30,"time":"2026-06-14T08:03:46.364Z","service":"fedify-sidecar","version":"5.0.0","msg":"Content fingerprint spam guard initialized"}
+{"level":30,"time":"2026-06-14T08:03:46.364Z","service":"fedify-sidecar","version":"5.0.0","msg":"Domain reputation store initialized"}
+{"level":30,"time":"2026-06-14T08:03:46.442Z","service":"fedify-sidecar","version":"5.0.0","msg":"FEP-3ab2 runtime started"}
+{"level":30,"time":"2026-06-14T08:03:46.443Z","service":"fedify-sidecar","version":"5.0.0","msg":"FEP-eb48 hashtag document endpoint registered (/tags/:tag)"}
+{"level":30,"time":"2026-06-14T08:03:46.444Z","service":"fedify-sidecar","version":"5.0.0","msg":"FEP-c648 blocked collection endpoint registered"}
+{"level":30,"time":"2026-06-14T08:03:46.444Z","service":"fedify-sidecar","version":"5.0.0","msg":"Muted collection endpoint registered"}
+{"level":30,"time":"2026-06-14T08:03:46.444Z","service":"fedify-sidecar","version":"5.0.0","msg":"AP E2EE MLS key packages endpoint registered"}
+{"level":30,"time":"2026-06-14T08:03:46.445Z","service":"fedify-sidecar","version":"5.0.0","msg":"AP E2EE MLS messages endpoint registered"}
+{"level":30,"time":"2026-06-14T08:03:46.452Z","service":"fedify-sidecar","version":"5.0.0","msg":"Fedify Sidecar listening on 0.0.0.0:8080"}
+{"level":30,"time":"2026-06-14T08:03:46.452Z","service":"fedify-sidecar","version":"5.0.0","msg":"Metrics available at http://0.0.0.0:8080/metrics"}
+{"level":30,"time":"2026-06-14T08:03:46.452Z","service":"fedify-sidecar","version":"5.0.0","msg":"Configuration summary"}
+{"level":30,"time":"2026-06-14T08:03:46.452Z","service":"fedify-sidecar","version":"5.0.0","msg":"HTTP server is listening while background startup continues"}
+{"level":30,"time":"2026-06-14T08:03:46.452Z","service":"fedify-sidecar","version":"5.0.0","msg":"Startup task started"}
+{"level":30,"time":"2026-06-14T08:03:46.464Z","service":"fedify-sidecar","version":"5.0.0","msg":"RedPanda producer connected"}
+{"level":30,"time":"2026-06-14T08:03:46.464Z","service":"fedify-sidecar","version":"5.0.0","msg":"RedPanda producer connected"}
+{"level":30,"time":"2026-06-14T08:03:46.464Z","service":"fedify-sidecar","version":"5.0.0","msg":"Startup task completed"}
+{"level":30,"time":"2026-06-14T08:03:46.464Z","service":"fedify-sidecar","version":"5.0.0","msg":"Startup task started"}
+{"level":30,"time":"2026-06-14T08:03:46.464Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Starting bootstrap"}
+{"level":40,"time":"2026-06-14T08:03:46.469Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":30,"time":"2026-06-14T08:03:46.472Z","service":"fedify-sidecar","version":"5.0.0","msg":"UnifiedFeedBridge started"}
+{"level":30,"time":"2026-06-14T08:03:46.481Z","service":"fedify-sidecar","version":"5.0.0","msg":"FeedStreamKafkaConsumer started"}
+{"level":40,"time":"2026-06-14T08:03:46.841Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:03:49.135Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:03:54.483Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:03:55.253Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:04:25.199Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:04:39.251Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:04:52.203Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:05:18.796Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:05:28.858Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:05:45.980Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":40,"time":"2026-06-14T08:05:45.983Z","service":"fedify-sidecar","version":"5.0.0","msg":"[OpenSearchBootstrap] Cluster health check failed"}
+{"level":50,"time":"2026-06-14T08:05:45.996Z","service":"fedify-sidecar","version":"5.0.0","error":"[OpenSearchBootstrap] Cluster not reachable after 12 attempts","startup":{"mode":"background","phase":"failed","currentStep":"bootstrap OpenSearch indices and pipelines","completedSteps":["connect RedPanda producer"],"failedStep":"bootstrap OpenSearch indices and pipelines","error":"[OpenSearchBootstrap] Cluster not reachable after 12 attempts","durationMs":119677,"startedAt":"2026-06-14T08:03:46.319Z","readyAt":null},"msg":"Background startup failed"}

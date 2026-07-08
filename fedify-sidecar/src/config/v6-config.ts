@@ -42,6 +42,14 @@ export const redisConfig = {
 };
 
 // ============================================================================
+// PostgreSQL Configuration (Local cache database)
+// ============================================================================
+
+export const postgresConfig = {
+  url: process.env["DATABASE_URL"] || 'postgresql://sidecar_user:sidecar_password@localhost:5432/fedify_sidecar',
+};
+
+// ============================================================================
 // RedPanda Configuration (Event Logs)
 // ============================================================================
 

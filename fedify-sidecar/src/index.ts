@@ -274,6 +274,9 @@ import { MediaAssetSyncConsumer } from "./media/MediaAssetSyncConsumer.js";
 import { evaluateMediaSignalPolicy } from "./media/MediaSignalPolicy.js";
 import type { MRFAdminStore } from "./admin/mrf/store.js";
 import { applyLocaleHeaders, resolveLocale, t as translateLocale } from "./http/locale.js";
+import { bootstrapDb, pool } from "./db/postgres.js";
+import { PostSyncWorker } from "./services/PostSyncWorker.js";
+
 
 function normalizeMrfAdminStoreMode(raw: string | undefined): "memory" | "redis" {
   if (raw === "memory" || raw === "redis") {
@@ -798,6 +801,7 @@ let unifiedFeedBridge: UnifiedFeedBridge | null = null;
 let fep3ab2Runtime: Fep3ab2Runtime | null = null;
 let entrywayRedisClient: Redis | null = null;
 let entrywayRecoveryWorker: EntrywayRecoveryWorker | null = null;
+let postSyncWorker: PostSyncWorker | null = null;
 let isShuttingDown = false;
 const startupState: StartupState = {
   mode: config.startupMode,
@@ -1446,6 +1450,24 @@ async function main() {
         },
       });
     }
+
+    // Initialize PostgreSQL cache database schema
+    startupTasks.push({
+      name: "bootstrap postgres database schema",
+      start: async () => {
+        await bootstrapDb();
+      },
+    });
+
+    // Start background post sync worker
+    postSyncWorker = new PostSyncWorker();
+    startupTasks.push({
+      name: "start post sync worker",
+      start: async () => {
+        postSyncWorker!.start();
+        logger.info("PostSyncWorker started");
+      },
+    });
 
     // Initialize outbound worker
     if (config.enableOutboundWorker) {
@@ -3935,6 +3957,20 @@ async function shutdown(signal: string): Promise<void> {
     if (writeResultStore) {
       await writeResultStore.close();
       logger.info("Write result store closed");
+    }
+
+    if (postSyncWorker) {
+      await postSyncWorker.stop();
+      postSyncWorker = null;
+      logger.info("Post sync worker stopped");
+    }
+
+    // Close PostgreSQL pool
+    try {
+      await pool.end();
+      logger.info("PostgreSQL client pool closed");
+    } catch (dbErr: any) {
+      logger.error("Error closing PostgreSQL pool", { error: dbErr.message });
     }
 
     if (identityWarmupService) {

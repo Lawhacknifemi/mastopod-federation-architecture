@@ -80,6 +80,7 @@
     "marked": "^14.0.0",
     "multiformats": "^13.4.2",
     "p-limit": "^5.0.0",
+    "pg": "^8.21.0",
     "pino": "^8.19.0",
     "pino-pretty": "^10.3.1",
     "prom-client": "^15.1.0",
@@ -91,6 +92,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@types/pg": "^8.20.0",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.57.1",
     "@typescript-eslint/parser": "^8.57.1",
