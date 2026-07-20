@@ -29,7 +29,29 @@ function stringToNumericId(str: string): number {
   return Math.abs(hash);
 }
 
-function mapToUnifiedFeedItem(item: any): any {
+// In-memory persistent like & reply tracking maps
+const userLikesMap = new Map<string, Set<string>>();
+const postLikeCountMap = new Map<string, number>();
+const postReplyCountMap = new Map<string, number>();
+
+function isPostLikedByUser(webId: string | undefined, postUri: string): boolean {
+  if (!webId) return false;
+  const userLikes = userLikesMap.get(webId);
+  return userLikes ? userLikes.has(postUri) : false;
+}
+
+function getPostLikeCount(postUri: string, baseCount: number): number {
+  const offset = postLikeCountMap.get(postUri) || 0;
+  return Math.max(0, baseCount + offset);
+}
+
+function getPostReplyCount(postUri: string, baseCount: number, dbCountsMap?: Map<string, number>): number {
+  const inMemoryOffset = postReplyCountMap.get(postUri) || 0;
+  const dbCount = dbCountsMap ? (dbCountsMap.get(postUri) || 0) : 0;
+  return Math.max(0, baseCount + inMemoryOffset + dbCount);
+}
+
+function mapToUnifiedFeedItem(item: any, viewerWebId?: string, dbCountsMap?: Map<string, number>): any {
   const isAtProto = item.id.startsWith("at://");
   
   let hasMedia = false;
@@ -59,6 +81,12 @@ function mapToUnifiedFeedItem(item: any): any {
     }
   }
 
+  const baseLikeCount = item.engagement?.likeCount || 0;
+  const finalLikeCount = getPostLikeCount(item.id, baseLikeCount);
+  const baseReplyCount = item.engagement?.replyCount || 0;
+  const finalReplyCount = getPostReplyCount(item.id, baseReplyCount, dbCountsMap);
+  const viewerHasLiked = isPostLikedByUser(viewerWebId, item.id) || !!item.engagement?.viewerHasLiked;
+
   return {
     id: numericId,
     content: item.content?.text || item.content?.html || "",
@@ -78,9 +106,11 @@ function mapToUnifiedFeedItem(item: any): any {
     source: isAtProto ? "atproto" : "activitypods",
     atUri: isAtProto ? item.id : null,
     objectUri: !isAtProto ? item.id : null,
-    replyParentUri: null,
-    replyRootUri: null,
-    likeCount: item.engagement?.likeCount || 0,
+    replyParentUri: item.replyToStableId || null,
+    replyRootUri: item.replyToStableId || null,
+    likeCount: finalLikeCount,
+    replyCount: finalReplyCount,
+    viewerHasLiked,
     repostCount: item.engagement?.shareCount || 0,
     quoteCount: 0,
     type: "post"
@@ -321,13 +351,32 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
         shape: "card"
       });
 
+      // Fetch DB reply counts grouped by in_reply_to
+      const dbReplyCountsMap = new Map<string, number>();
+      try {
+        const { rows: replyCountRows } = await pool.query(
+          `SELECT in_reply_to, COUNT(*) as cnt FROM local_cache_posts WHERE in_reply_to IS NOT NULL GROUP BY in_reply_to`
+        );
+        for (const r of replyCountRows) {
+          if (r.in_reply_to) {
+            dbReplyCountsMap.set(r.in_reply_to, parseInt(r.cnt, 10));
+          }
+        }
+      } catch (err) {
+        console.error("Failed to query DB reply counts:", err);
+      }
+
       const mappedItems: any[] = [];
       for (const item of hydrated.items) {
         const presence = item.protocolPresence || (item.id.startsWith("at://") ? ["at"] : ["ap", "at"]);
         if (query.source === "atproto" && !presence.includes("at")) continue;
         if (query.source === "activitypods" && !presence.includes("ap")) continue;
 
-        mappedItems.push(mapToUnifiedFeedItem(item));
+        const mapped = mapToUnifiedFeedItem(item, webId, dbReplyCountsMap);
+        // Exclude direct replies from the top-level timeline feed
+        if (mapped.replyParentUri || item.replyToStableId) continue;
+
+        mappedItems.push(mapped);
       }
 
       // Query unsynced posts from local cache database
@@ -335,8 +384,9 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       let unsyncedItems: any[] = [];
       try {
         const { rows } = await pool.query(
-          `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, created_at
+          `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, in_reply_to, created_at
            FROM local_cache_posts
+           WHERE in_reply_to IS NULL
            ORDER BY created_at DESC`
         );
         
@@ -346,9 +396,10 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
           const isAtProtoOnly = row.target_protocol === "atproto";
           const itemSource = isAtProtoOnly ? "atproto" : "activitypods";
           const atUri = `at://did:plc:${authorName}/app.bsky.feed.post/${row.id.replace(/-/g, '')}`;
+          const postId = isAtProtoOnly ? atUri : objectUri;
           
           return {
-            id: isAtProtoOnly ? atUri : objectUri,
+            id: postId,
             content: row.content,
             postType: row.post_type,
             title: row.name || null,
@@ -364,10 +415,15 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
             source: itemSource,
             atUri: (row.target_protocol === "atproto" || row.target_protocol === "all") ? atUri : null,
             objectUri: objectUri,
+            replyParentUri: row.in_reply_to || null,
+            replyRootUri: row.in_reply_to || null,
             type: "post",
             protocolPresence: isAtProtoOnly ? ["at"] : (row.target_protocol === "activitypods" ? ["ap"] : ["ap", "at"]),
             hashtags: row.hashtags || [],
-            attachments: Array.isArray(row.attachments) ? row.attachments : []
+            attachments: Array.isArray(row.attachments) ? row.attachments : [],
+            likeCount: getPostLikeCount(postId, 0),
+            replyCount: getPostReplyCount(postId, 0, dbReplyCountsMap),
+            viewerHasLiked: isPostLikedByUser(webId, postId)
           };
         });
 
@@ -473,41 +529,162 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
         shape: "card"
       });
 
-      const rootItem = rootHydrateRes.items[0];
-      if (!rootItem) {
-        reply.code(404).send({ error: "not_found", message: "Thread root not found" });
-        return;
+      let rootItemMapped: any = null;
+      let rootStableId = rootUri;
+
+      if (rootHydrateRes.items && rootHydrateRes.items[0]) {
+        rootItemMapped = mapToUnifiedFeedItem(rootHydrateRes.items[0], webId);
+        rootStableId = rootHydrateRes.items[0].id || rootUri;
+      } else {
+        // Fallback: Query local_cache_posts for root item
+        try {
+          const { rows } = await pool.query(
+            `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, in_reply_to, created_at
+             FROM local_cache_posts
+             WHERE id::text = $1 OR actor_uri LIKE '%' || $1 OR $1 LIKE '%' || id::text`,
+            [rootUri.split('/').pop()]
+          );
+          if (rows.length > 0) {
+            const row = rows[0];
+            const authorName = row.actor_uri.split("/").pop() || "user";
+            const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
+            const objectUri = `${activityPodsUrl}/${authorName}/data/${row.post_type === "article" ? "article" : "note"}/${row.id}`;
+            const isAtProtoOnly = row.target_protocol === "atproto";
+            const atUri = `at://did:plc:${authorName}/app.bsky.feed.post/${row.id.replace(/-/g, '')}`;
+            const postId = isAtProtoOnly ? atUri : objectUri;
+            rootStableId = objectUri;
+            rootItemMapped = {
+              id: stringToNumericId(postId),
+              content: row.content,
+              postType: row.post_type,
+              title: row.name || null,
+              summary: row.summary || null,
+              canonicalUrl: objectUri,
+              createdAt: row.created_at.toISOString(),
+              isPublic: true,
+              authorId: null,
+              authorName: authorName,
+              authorWebId: row.actor_uri,
+              authorProviderEndpoint: new URL(row.actor_uri).origin,
+              authorAvatar: null,
+              source: isAtProtoOnly ? "atproto" : "activitypods",
+              atUri: (row.target_protocol === "atproto" || row.target_protocol === "all") ? atUri : null,
+              objectUri: objectUri,
+              replyParentUri: row.in_reply_to || null,
+              replyRootUri: row.in_reply_to || null,
+              type: "post",
+              protocolPresence: isAtProtoOnly ? ["at"] : (row.target_protocol === "activitypods" ? ["ap"] : ["ap", "at"]),
+              hashtags: row.hashtags || [],
+              attachments: Array.isArray(row.attachments) ? row.attachments : [],
+              likeCount: getPostLikeCount(postId, 0),
+              replyCount: getPostReplyCount(postId, 0),
+              viewerHasLiked: isPostLikedByUser(webId, postId)
+            };
+          }
+        } catch (err) {
+          console.error("Failed to query root item from local_cache_posts:", err);
+        }
       }
 
-      const rootStableId = rootItem.id;
-      const replyDocs = await queryReplies(rootStableId, 100);
+      const mappedReplies: any[] = [];
 
-      const hydrationItems = replyDocs.map((doc: any) => {
-        const isAt = doc.at?.uri ? true : false;
-        return isAt 
-          ? { canonicalUri: doc.at.uri }
-          : { activityPubObjectId: doc.ap.objectUri };
+      // 1. Hydrate OpenSearch / vector replies
+      try {
+        const replyDocs = await queryReplies(rootStableId, 100);
+        if (replyDocs.length > 0) {
+          const hydrationItems = replyDocs.map((doc: any) => {
+            const isAt = doc.at?.uri ? true : false;
+            return isAt 
+              ? { canonicalUri: doc.at.uri }
+              : { activityPubObjectId: doc.ap.objectUri };
+          });
+
+          const hydratedReplies = await deps.hydrationService.hydrate({
+            viewerId: webId,
+            items: hydrationItems,
+            shape: "card"
+          });
+
+          mappedReplies.push(...hydratedReplies.items.map(r => mapToUnifiedFeedItem(r, webId)));
+        }
+      } catch (err) {
+        console.warn("Failed to query vector replies:", err);
+      }
+      
+      // 2. Query local cache replies for thread
+      try {
+        const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
+        const { rows } = await pool.query(
+          `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, in_reply_to, created_at
+           FROM local_cache_posts
+           WHERE in_reply_to = $1 
+              OR in_reply_to = $2
+              OR ($3 != '' AND in_reply_to = $3)
+              OR ($4 != '' AND in_reply_to = $4)
+              OR ($5 != '' AND in_reply_to = $5)
+           ORDER BY created_at ASC`,
+          [
+            rootUri,
+            rootStableId,
+            rootItemMapped?.objectUri || '',
+            rootItemMapped?.atUri || '',
+            String(rootItemMapped?.id || '')
+          ]
+        );
+        for (const row of rows) {
+          const authorName = row.actor_uri.split("/").pop() || "user";
+          const objectUri = `${activityPodsUrl}/${authorName}/data/note/${row.id}`;
+          const isAtProtoOnly = row.target_protocol === "atproto";
+          const atUri = `at://did:plc:${authorName}/app.bsky.feed.post/${row.id.replace(/-/g, '')}`;
+          const postId = isAtProtoOnly ? atUri : objectUri;
+
+          mappedReplies.push({
+            id: stringToNumericId(postId),
+            content: row.content,
+            postType: row.post_type,
+            title: null,
+            summary: null,
+            canonicalUrl: objectUri,
+            createdAt: row.created_at.toISOString(),
+            isPublic: true,
+            authorId: null,
+            authorName: authorName,
+            authorWebId: row.actor_uri,
+            authorProviderEndpoint: new URL(row.actor_uri).origin,
+            authorAvatar: null,
+            source: isAtProtoOnly ? "atproto" : "activitypods",
+            atUri: isAtProtoOnly ? atUri : null,
+            objectUri: objectUri,
+            replyParentUri: row.in_reply_to,
+            replyRootUri: row.in_reply_to,
+            type: "post",
+            likeCount: getPostLikeCount(postId, 0),
+            viewerHasLiked: isPostLikedByUser(webId, postId)
+          });
+        }
+      } catch (dbErr) {
+        console.error("Failed to query thread local replies:", dbErr);
+      }
+
+      // Deduplicate replies by objectUri or id
+      const seenReplies = new Set<string>();
+      const uniqueReplies = mappedReplies.filter(r => {
+        const key = r.objectUri || r.atUri || String(r.id);
+        if (seenReplies.has(key)) return false;
+        seenReplies.add(key);
+        return true;
       });
-
-      const hydratedReplies = await deps.hydrationService.hydrate({
-        viewerId: webId,
-        items: hydrationItems,
-        shape: "card"
-      });
-
-      const mappedReplies = hydratedReplies.items.map(mapToUnifiedFeedItem);
-      const rootItemMapped = mapToUnifiedFeedItem(rootItem);
 
       reply.send({
         rootUri,
         root: rootItemMapped,
-        items: mappedReplies,
+        items: uniqueReplies,
         nextCursor: null,
         hasMore: false,
-        replyCount: mappedReplies.length,
-        participantCount: new Set(mappedReplies.map(r => r.authorWebId)).size,
-        lastActivityAt: mappedReplies.length > 0 
-          ? new Date(Math.max(...mappedReplies.map(r => new Date(r.createdAt).getTime()))).toISOString()
+        replyCount: uniqueReplies.length,
+        participantCount: new Set(uniqueReplies.map(r => r.authorWebId)).size,
+        lastActivityAt: uniqueReplies.length > 0 
+          ? new Date(Math.max(...uniqueReplies.map(r => new Date(r.createdAt).getTime()))).toISOString()
           : rootItemMapped?.createdAt || new Date().toISOString()
       });
     } catch (err) {
@@ -883,5 +1060,260 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       console.error("Signup failed:", err);
       reply.code(500).send({ error: "internal_error", message: String(err) });
     }
+  });
+
+  // POST /at/like - Like a post
+  app.post("/at/like", async (req, reply) => {
+    const authedWebId = (await getAuthedWebId(req)) || "http://activitypods:3000/testuser";
+    const body = parseRequestBody(req.body);
+    const { postUri, targetProtocol = "all", actorUri = authedWebId } = body;
+
+    if (!postUri) {
+      reply.code(400).send({ error: "invalid_request", message: "postUri is required" });
+      return;
+    }
+
+    // Record like in local in-memory state
+    if (!userLikesMap.has(authedWebId)) {
+      userLikesMap.set(authedWebId, new Set());
+    }
+    const userSet = userLikesMap.get(authedWebId)!;
+    if (!userSet.has(postUri)) {
+      userSet.add(postUri);
+      const currentOffset = postLikeCountMap.get(postUri) || 0;
+      postLikeCountMap.set(postUri, currentOffset + 1);
+    }
+
+    const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
+    const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
+
+    try {
+      // 1. ActivityPods Outbox Like Activity
+      if (targetProtocol === "all" || targetProtocol === "activitypods" || targetProtocol === "ap") {
+        const likeActivity = {
+          "@context": "https://www.w3.org/ns/activitystreams",
+          type: "Like",
+          actor: actorUri,
+          object: postUri,
+          to: ["https://www.w3.org/ns/activitystreams#Public"]
+        };
+
+        await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${activityPodsToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ actorUri, activity: likeActivity })
+        }).catch(err => console.error("Outbox Like error:", err));
+      }
+
+      // 2. ATProto Like Record
+      if (targetProtocol === "all" || targetProtocol === "atproto" || targetProtocol === "at") {
+        const atprotoDid = "did:plc:testuser123";
+        const likeRecord = {
+          $type: "app.bsky.feed.like",
+          subject: {
+            uri: postUri,
+            cid: "bafyreidplaceholder"
+          },
+          createdAt: new Date().toISOString()
+        };
+
+        await fetch(`${activityPodsUrl}/atproto/com.atproto.repo.createRecord`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${activityPodsToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            repo: atprotoDid,
+            collection: "app.bsky.feed.like",
+            record: likeRecord
+          })
+        }).catch(err => console.error("ATProto Like Record error:", err));
+      }
+
+      reply.send({ ok: true, liked: true, postUri });
+    } catch (err) {
+      console.error("Like failed:", err);
+      reply.code(500).send({ error: "internal_error", message: String(err) });
+    }
+  });
+
+  // DELETE /at/like - Unlike a post
+  app.delete("/at/like", async (req, reply) => {
+    const authedWebId = (await getAuthedWebId(req)) || "http://activitypods:3000/testuser";
+    const body = parseRequestBody(req.body);
+    const { postUri, targetProtocol = "all", actorUri = authedWebId } = body;
+
+    if (!postUri) {
+      reply.code(400).send({ error: "invalid_request", message: "postUri is required" });
+      return;
+    }
+
+    // Remove like from local state
+    const userSet = userLikesMap.get(authedWebId);
+    if (userSet && userSet.has(postUri)) {
+      userSet.delete(postUri);
+      const currentOffset = postLikeCountMap.get(postUri) || 0;
+      postLikeCountMap.set(postUri, Math.max(-10, currentOffset - 1));
+    }
+
+    const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
+    const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
+
+    try {
+      if (targetProtocol === "all" || targetProtocol === "activitypods" || targetProtocol === "ap") {
+        const undoActivity = {
+          "@context": "https://www.w3.org/ns/activitystreams",
+          type: "Undo",
+          actor: actorUri,
+          object: {
+            type: "Like",
+            actor: actorUri,
+            object: postUri
+          },
+          to: ["https://www.w3.org/ns/activitystreams#Public"]
+        };
+
+        await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${activityPodsToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ actorUri, activity: undoActivity })
+        }).catch(err => console.error("Outbox Undo Like error:", err));
+      }
+
+      reply.send({ ok: true, liked: false, postUri });
+    } catch (err) {
+      console.error("Unlike failed:", err);
+      reply.code(500).send({ error: "internal_error", message: String(err) });
+    }
+  });
+
+  // POST /at/reply - Reply / Comment on a post
+  app.post("/at/reply", async (req, reply) => {
+    const body = parseRequestBody(req.body);
+    const { parentUri, text, targetProtocol = "all", actorUri = "http://activitypods:3000/testuser" } = body;
+
+    if (!parentUri || !text) {
+      reply.code(400).send({ error: "invalid_request", message: "parentUri and text are required" });
+      return;
+    }
+
+    const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
+    const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
+
+    try {
+      const timestamp = new Date().toISOString();
+      const replyId = crypto.randomUUID();
+      const replyNoteId = `${activityPodsUrl}/notes/reply-${Date.now()}`;
+
+      // Increment parent reply count in local state
+      const currentOffset = postReplyCountMap.get(parentUri) || 0;
+      postReplyCountMap.set(parentUri, currentOffset + 1);
+
+      // Save reply post to local_cache_posts table so it appears in feed / thread queries
+      await pool.query(
+        `INSERT INTO local_cache_posts (
+          id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, in_reply_to, synced_to_fuseki
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE)`,
+        [
+          replyId,
+          actorUri,
+          text,
+          "note",
+          null,
+          null,
+          [],
+          JSON.stringify([]),
+          targetProtocol === "atproto" || targetProtocol === "activitypods" ? targetProtocol : "all",
+          parentUri
+        ]
+      ).catch(err => console.error("Failed to insert reply into local_cache_posts:", err));
+
+      // 1. ActivityPods Outbox Reply Note
+      if (targetProtocol === "all" || targetProtocol === "activitypods" || targetProtocol === "ap") {
+        const noteActivity = {
+          "@context": "https://www.w3.org/ns/activitystreams",
+          type: "Create",
+          actor: actorUri,
+          object: {
+            id: replyNoteId,
+            type: "Note",
+            attributedTo: actorUri,
+            content: text,
+            inReplyTo: parentUri,
+            published: timestamp,
+            to: ["https://www.w3.org/ns/activitystreams#Public"]
+          }
+        };
+
+        await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${activityPodsToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ actorUri, activity: noteActivity })
+        }).catch(err => console.error("Outbox Reply Note error:", err));
+      }
+
+      // 2. ATProto Reply Record
+      if (targetProtocol === "all" || targetProtocol === "atproto" || targetProtocol === "at") {
+        const atprotoDid = "did:plc:testuser123";
+        const replyRecord = {
+          $type: "app.bsky.feed.post",
+          text,
+          reply: {
+            root: { uri: parentUri, cid: "bafyreidplaceholder" },
+            parent: { uri: parentUri, cid: "bafyreidplaceholder" }
+          },
+          createdAt: timestamp
+        };
+
+        await fetch(`${activityPodsUrl}/atproto/com.atproto.repo.createRecord`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${activityPodsToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            repo: atprotoDid,
+            collection: "app.bsky.feed.post",
+            record: replyRecord
+          })
+        }).catch(err => console.error("ATProto Reply Record error:", err));
+      }
+
+      reply.send({
+        ok: true,
+        replyUri: replyNoteId,
+        parentUri,
+        text
+      });
+    } catch (err) {
+      console.error("Reply failed:", err);
+      reply.code(500).send({ error: "internal_error", message: String(err) });
+    }
+  });
+
+  // POST /at/replies/resolve - Resolve reply policy for a post
+  app.post("/at/replies/resolve", async (req, reply) => {
+    const body = parseRequestBody(req.body);
+    const objectUri = body.objectUri || body.parentUri || body.uri || "";
+
+    reply.send({
+      objectUri,
+      mayReply: true,
+      requiresApproval: false,
+      canReplyIsSet: true,
+      authorityUri: null,
+      policyLabel: "Public",
+      reason: "Public post allows replies"
+    });
   });
 }

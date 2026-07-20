@@ -31,11 +31,13 @@ export async function bootstrapDb(): Promise<void> {
       last_attempt_at TIMESTAMP,
       error_message TEXT,
       target_protocol VARCHAR(32) DEFAULT 'all',
+      in_reply_to TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
     ALTER TABLE local_cache_posts ADD COLUMN IF NOT EXISTS target_protocol VARCHAR(32) DEFAULT 'all';
+    ALTER TABLE local_cache_posts ADD COLUMN IF NOT EXISTS in_reply_to TEXT;
 
     CREATE INDEX IF NOT EXISTS idx_unsynced_posts 
     ON local_cache_posts(synced_to_fuseki) 
