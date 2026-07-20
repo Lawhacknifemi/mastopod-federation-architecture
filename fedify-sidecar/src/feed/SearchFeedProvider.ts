@@ -154,18 +154,22 @@ function isSafeUrl(value: string | undefined): value is string {
   }
 }
 
+function isSafeAtUri(value: string | undefined): value is string {
+  return Boolean(value && value.startsWith("at://") && !/[\u0000-\u001F\u007F]/.test(value));
+}
+
 function isSafeDid(value: string | undefined): value is string {
   return Boolean(value && value.startsWith("did:") && !/[\u0000-\u001F\u007F]/.test(value));
 }
 
 function selectCanonicalUri(doc: PublicContentDocument): string | null {
-  if (isSafeUrl(doc.canonicalContentId)) {
+  if (isSafeUrl(doc.canonicalContentId) || isSafeAtUri(doc.canonicalContentId)) {
     return doc.canonicalContentId;
   }
   if (isSafeUrl(doc.ap?.objectUri)) {
     return doc.ap.objectUri;
   }
-  if (isSafeUrl(doc.at?.uri)) {
+  if (isSafeAtUri(doc.at?.uri)) {
     return doc.at.uri;
   }
   return null;

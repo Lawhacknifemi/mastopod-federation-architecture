@@ -64,7 +64,7 @@ export class PostSyncWorker {
     try {
       // Find up to 10 unsynced posts, skipping poisoned records (sync_attempts >= 5)
       const { rows } = await pool.query(
-        `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, sync_attempts
+        `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, sync_attempts
          FROM local_cache_posts
          WHERE synced_to_fuseki = FALSE AND sync_attempts < 5
          ORDER BY created_at ASC
@@ -92,6 +92,20 @@ export class PostSyncWorker {
    * Synchronize a single post to the ActivityPods outbox
    */
   private async syncPost(row: any): Promise<void> {
+    // If target protocol is strictly ATProto, mark synced without sending to ActivityPods outbox
+    if (row.target_protocol === "atproto") {
+      await pool.query(
+        `UPDATE local_cache_posts
+         SET synced_to_fuseki = TRUE,
+             updated_at = NOW(),
+             error_message = NULL
+         WHERE id = $1`,
+        [row.id]
+      );
+      logger.info(`[PostSyncWorker] ATProto-targeted post ${row.id} processed`, { postId: row.id });
+      return;
+    }
+
     const activityPodsUrl = activityPodsConfig.url.replace(/\/$/, "");
     const activityPodsToken = activityPodsConfig.token;
     const webId = row.actor_uri;
@@ -122,7 +136,7 @@ export class PostSyncWorker {
       actor: webId,
       to: ["https://www.w3.org/ns/activitystreams#Public"],
       object: {
-        id: objectUri,
+        "@id": objectUri,
         type: row.post_type === "article" ? "Article" : "Note",
         attributedTo: webId,
         content: row.content || "",
@@ -146,7 +160,11 @@ export class PostSyncWorker {
 
       if (!response.ok) {
         const text = await response.text().catch(() => "");
-        throw new Error(`HTTP ${response.status}: ${text}`);
+        if (response.status === 400 && text.includes("already exist")) {
+          logger.info(`[PostSyncWorker] Resource ${row.id} already exists in ActivityPods, marking synced`, { postId: row.id });
+        } else {
+          throw new Error(`HTTP ${response.status}: ${text}`);
+        }
       }
 
       // Sync successful - update record in DB

@@ -15,7 +15,7 @@ export class SearchHydrator implements PodHydrator {
       if (item.stableId) {
         stableIds.add(item.stableId);
       }
-      if (item.canonicalUri && isSafeUrl(item.canonicalUri)) {
+      if (item.canonicalUri && (isSafeUrl(item.canonicalUri) || isSafeAtUri(item.canonicalUri))) {
         canonicalUris.add(item.canonicalUri);
       }
       if (item.activityPubObjectId && isSafeUrl(item.activityPubObjectId)) {
@@ -30,7 +30,7 @@ export class SearchHydrator implements PodHydrator {
 
     for (const doc of docs) {
       docsByStableId.set(doc.stableDocId, doc);
-      if (isSafeUrl(doc.canonicalContentId)) {
+      if (isSafeUrl(doc.canonicalContentId) || isSafeAtUri(doc.canonicalContentId)) {
         docsByCanonicalUri.set(doc.canonicalContentId, doc);
       }
       if (isSafeUrl(doc.ap?.objectUri)) {
@@ -69,9 +69,9 @@ export class SearchHydrator implements PodHydrator {
 function toHydratedObject(doc: PublicContentDocument, source: FeedSource): HydratedObject | null {
   const id = isSafeUrl(doc.ap?.objectUri)
     ? doc.ap.objectUri
-    : isSafeUrl(doc.at?.uri)
+    : isSafeAtUri(doc.at?.uri)
       ? doc.at.uri
-      : isSafeUrl(doc.canonicalContentId)
+      : (isSafeUrl(doc.canonicalContentId) || isSafeAtUri(doc.canonicalContentId))
         ? doc.canonicalContentId
         : null;
 
@@ -151,6 +151,10 @@ function isSafeUrl(value: string | undefined): value is string {
   } catch {
     return false;
   }
+}
+
+function isSafeAtUri(value: string | undefined): value is string {
+  return Boolean(value && value.startsWith("at://") && !/[\u0000-\u001F\u007F]/.test(value));
 }
 
 function isSafeDid(value: string | undefined): value is string {

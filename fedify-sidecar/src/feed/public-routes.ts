@@ -323,9 +323,9 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
 
       const mappedItems: any[] = [];
       for (const item of hydrated.items) {
-        const isAtProto = item.id.startsWith("at://");
-        if (query.source === "atproto" && !isAtProto) continue;
-        if (query.source === "activitypods" && isAtProto) continue;
+        const presence = item.protocolPresence || (item.id.startsWith("at://") ? ["at"] : ["ap", "at"]);
+        if (query.source === "atproto" && !presence.includes("at")) continue;
+        if (query.source === "activitypods" && !presence.includes("ap")) continue;
 
         mappedItems.push(mapToUnifiedFeedItem(item));
       }
@@ -335,18 +335,20 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       let unsyncedItems: any[] = [];
       try {
         const { rows } = await pool.query(
-          `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, created_at
+          `SELECT id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, created_at
            FROM local_cache_posts
-           WHERE synced_to_fuseki = FALSE
            ORDER BY created_at DESC`
         );
         
         const rawUnsynced = rows.map((row: any) => {
           const authorName = row.actor_uri.split("/").pop() || "user";
           const objectUri = `${activityPodsUrl}/${authorName}/data/${row.post_type === "article" ? "article" : "note"}/${row.id}`;
+          const isAtProtoOnly = row.target_protocol === "atproto";
+          const itemSource = isAtProtoOnly ? "atproto" : "activitypods";
+          const atUri = `at://did:plc:${authorName}/app.bsky.feed.post/${row.id.replace(/-/g, '')}`;
           
           return {
-            id: objectUri,
+            id: isAtProtoOnly ? atUri : objectUri,
             content: row.content,
             postType: row.post_type,
             title: row.name || null,
@@ -359,11 +361,11 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
             authorWebId: row.actor_uri,
             authorProviderEndpoint: new URL(row.actor_uri).origin,
             authorAvatar: null,
-            source: "activitypods",
-            atUri: null,
+            source: itemSource,
+            atUri: (row.target_protocol === "atproto" || row.target_protocol === "all") ? atUri : null,
             objectUri: objectUri,
             type: "post",
-            protocolPresence: ["ap", "at"],
+            protocolPresence: isAtProtoOnly ? ["at"] : (row.target_protocol === "activitypods" ? ["ap"] : ["ap", "at"]),
             hashtags: row.hashtags || [],
             attachments: Array.isArray(row.attachments) ? row.attachments : []
           };
@@ -371,6 +373,9 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
 
         // Filter unsynced items based on hashtag / source query
         unsyncedItems = rawUnsynced.filter((item: any) => {
+          if (query.source === "atproto" && !item.protocolPresence.includes("at")) return false;
+          if (query.source === "activitypods" && !item.protocolPresence.includes("ap")) return false;
+
           if (query.hashtag) {
             const hashtagClean = (query.hashtag as string).toLowerCase().replace(/^#/, "");
             const tagMatch = item.hashtags.some((h: string) => h.toLowerCase().replace(/^#/, "") === hashtagClean);
@@ -692,7 +697,7 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
     }
 
     const body = parseRequestBody(req.body);
-    const { content, postType = "note", name, summary, hashtags = [], attachments = [] } = body;
+    const { content, postType = "note", name, summary, hashtags = [], attachments = [], targetProtocol = "all" } = body;
 
     if (!content && attachments.length === 0) {
       reply.code(400).send({ error: "invalid_request", message: "Post content or attachment is required" });
@@ -703,13 +708,14 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
     const postId = crypto.randomUUID();
     const username = webId.split("/").pop() || "user";
     const objectUri = `${activityPodsUrl}/${username}/data/${postType === "article" ? "article" : "note"}/${postId}`;
+    const normalizedTargetProtocol = (targetProtocol === "atproto" || targetProtocol === "activitypods") ? targetProtocol : "all";
 
     try {
       // Save post metadata to local PG cache
       await pool.query(
         `INSERT INTO local_cache_posts (
-          id, actor_uri, content, post_type, name, summary, hashtags, attachments, synced_to_fuseki
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, FALSE)`,
+          id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, synced_to_fuseki
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE)`,
         [
           postId,
           webId,
@@ -719,10 +725,11 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
           summary || null,
           hashtags,
           JSON.stringify(attachments),
+          normalizedTargetProtocol,
         ]
       );
 
-      reply.code(201).send({ ok: true, objectUri });
+      reply.code(201).send({ ok: true, objectUri, targetProtocol: normalizedTargetProtocol });
     } catch (err: any) {
       console.error("[create-post] Failed to cache post in PostgreSQL:", err);
       reply.code(500).send({ error: "internal_error", message: `Failed to queue post: ${err.message}` });

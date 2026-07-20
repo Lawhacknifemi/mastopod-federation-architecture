@@ -30,9 +30,12 @@ export async function bootstrapDb(): Promise<void> {
       sync_attempts INTEGER DEFAULT 0,
       last_attempt_at TIMESTAMP,
       error_message TEXT,
+      target_protocol VARCHAR(32) DEFAULT 'all',
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW()
     );
+
+    ALTER TABLE local_cache_posts ADD COLUMN IF NOT EXISTS target_protocol VARCHAR(32) DEFAULT 'all';
 
     CREATE INDEX IF NOT EXISTS idx_unsynced_posts 
     ON local_cache_posts(synced_to_fuseki) 
