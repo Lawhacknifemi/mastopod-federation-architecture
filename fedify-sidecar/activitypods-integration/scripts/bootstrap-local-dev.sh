@@ -5,7 +5,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 AP_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 WORK_ROOT=$(CDPATH= cd -- "$AP_ROOT/.." && pwd)
 FEDIFY_ROOT="$WORK_ROOT"
-AP_ROOT=$(CDPATH= cd -- "$WORK_ROOT/../../activitypods" && pwd)
+AP_ROOT=$(CDPATH= cd -- "$WORK_ROOT/../activitpod-aptoroto/activitypods" && pwd)
 MEDIA_ROOT="$WORK_ROOT/../media-pipeline-sidecar"
 
 log() {
