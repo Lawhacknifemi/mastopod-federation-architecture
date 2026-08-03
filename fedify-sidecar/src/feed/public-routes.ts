@@ -430,13 +430,13 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
 
       const mappedItems: any[] = [];
       for (const item of hydrated.items) {
-        const presence = item.protocolPresence || (item.id.startsWith("at://") ? ["at"] : ["ap", "at"]);
+        const presence = (item as any).protocolPresence || (item.id.startsWith("at://") ? ["at"] : ["ap", "at"]);
         if (query.source === "atproto" && !presence.includes("at")) continue;
         if (query.source === "activitypods" && !presence.includes("ap")) continue;
 
         const mapped = mapToUnifiedFeedItem(item, webId, dbReplyCountsMap);
         // Exclude direct replies from the top-level timeline feed
-        if (mapped.replyParentUri || item.replyToStableId) continue;
+        if (mapped.replyParentUri || (item as any).replyToStableId) continue;
 
         mappedItems.push(mapped);
       }
