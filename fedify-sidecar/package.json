@@ -19,6 +19,7 @@
     "test:harness": "tsx src/at-adapter/tests/local-harness.ts",
     "test:harness:phase7": "tsx src/at-adapter/tests/Phase7WriteProof.ts",
     "test:live:phase7": "tsx src/at-adapter/tests/Phase7LiveProof.ts",
+    "firehose:listen": "node scripts/listen-local-firehose.js",
     "proof:identity-sync": "tsx src/at-adapter/tests/UnifiedAccountIdentitySyncProof.ts",
     "proof:identity-sync:write-miss": "tsx src/at-adapter/tests/IdentitySyncWriteMissProof.ts",
     "proof:identity-warmup": "tsx src/at-adapter/tests/IdentityWarmupProof.ts",
