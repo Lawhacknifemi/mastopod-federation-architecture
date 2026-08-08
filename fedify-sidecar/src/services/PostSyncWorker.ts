@@ -6,10 +6,36 @@ export class PostSyncWorker {
   private timer: NodeJS.Timeout | null = null;
   private isRunning: boolean = false;
   private isTickActive: boolean = false;
+  private retriggerPending: boolean = false;
   private readonly intervalMs: number;
 
   constructor(intervalMs: number = 5000) {
     this.intervalMs = intervalMs;
+  }
+
+  /**
+   * Ask for an immediate sync attempt instead of waiting for the next
+   * periodic tick — called right after a new post is cached so the
+   * common case doesn't pay for a fixed poll delay.
+   *
+   * Deliberately preserves the same one-write-in-flight-at-a-time
+   * discipline the periodic poll already has (see tick()'s isTickActive
+   * guard): if nothing is running, this starts a tick now; if a tick is
+   * already in flight, it just flags that another pass is needed the
+   * moment the current one finishes, rather than firing a second
+   * concurrent tick. Total writes against Fuseki/ActivityPods per post
+   * are unchanged either way — this only removes idle waiting when the
+   * worker has nothing else to do.
+   */
+  triggerNow(): void {
+    if (!this.isRunning) {
+      return;
+    }
+    if (this.isTickActive) {
+      this.retriggerPending = true;
+      return;
+    }
+    void this.tick();
   }
 
   /**
@@ -85,6 +111,16 @@ export class PostSyncWorker {
       logger.error("[PostSyncWorker] Tick processing error", { error: err.message });
     } finally {
       this.isTickActive = false;
+
+      // A triggerNow() call arrived while this tick was running — run
+      // once more immediately rather than making that post wait for the
+      // periodic timer. Still only one tick active at a time.
+      if (this.retriggerPending) {
+        this.retriggerPending = false;
+        if (this.isRunning) {
+          void this.tick();
+        }
+      }
     }
   }
 
@@ -92,17 +128,13 @@ export class PostSyncWorker {
    * Synchronize a single post to the ActivityPods outbox
    */
   private async syncPost(row: any): Promise<void> {
-    // If target protocol is strictly ATProto, mark synced without sending to ActivityPods outbox
+    // ATProto-only posts never touch the ActivityPub outbox — they go
+    // straight to ActivityPods' /atproto-post endpoint, which creates an
+    // app.bsky.feed.post record directly with no AP resource/activity at
+    // all. This used to just mark the row synced and return without
+    // calling anything, which silently dropped the post on both networks.
     if (row.target_protocol === "atproto") {
-      await pool.query(
-        `UPDATE local_cache_posts
-         SET synced_to_fuseki = TRUE,
-             updated_at = NOW(),
-             error_message = NULL
-         WHERE id = $1`,
-        [row.id]
-      );
-      logger.info(`[PostSyncWorker] ATProto-targeted post ${row.id} processed`, { postId: row.id });
+      await this.syncAtprotoOnlyPost(row);
       return;
     }
 
@@ -155,7 +187,7 @@ export class PostSyncWorker {
           "Authorization": `Bearer ${activityPodsToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ actorUri: webId, activity }),
+        body: JSON.stringify({ actorUri: webId, activity, targetProtocol: row.target_protocol }),
       });
 
       if (!response.ok) {
@@ -191,6 +223,77 @@ export class PostSyncWorker {
       });
 
       // Update sync attempts counter and save error message
+      await pool.query(
+        `UPDATE local_cache_posts
+         SET sync_attempts = sync_attempts + 1,
+             last_attempt_at = NOW(),
+             error_message = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [errorMsg, row.id]
+      );
+    }
+  }
+
+  /**
+   * Sync a post whose target_protocol is strictly "atproto" — calls
+   * ActivityPods' /atproto-post endpoint, which creates an
+   * app.bsky.feed.post record directly (no AP resource/activity created).
+   */
+  private async syncAtprotoOnlyPost(row: any): Promise<void> {
+    const activityPodsUrl = activityPodsConfig.url.replace(/\/$/, "");
+    const activityPodsToken = activityPodsConfig.token;
+    const webId = row.actor_uri;
+
+    const tags = (row.hashtags || []).map((tag: string) => ({
+      type: "Hashtag",
+      name: tag.startsWith("#") ? tag : `#${tag}`,
+      href: `${activityPodsUrl}/tags/${tag.replace(/^#/, "")}`,
+    }));
+
+    const attachments = Array.isArray(row.attachments) ? row.attachments : [];
+
+    try {
+      const response = await fetch(`${activityPodsUrl}/api/internal/social/atproto-post`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${activityPodsToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          actorUri: webId,
+          content: row.content || "",
+          tags: tags.length > 0 ? tags : undefined,
+          attachments: attachments.length > 0 ? attachments : undefined,
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(`HTTP ${response.status}: ${text}`);
+      }
+
+      await pool.query(
+        `UPDATE local_cache_posts
+         SET synced_to_fuseki = TRUE,
+             updated_at = NOW(),
+             error_message = NULL
+         WHERE id = $1`,
+        [row.id]
+      );
+
+      logger.info(`[PostSyncWorker] Successfully synced ATProto-only post ${row.id}`, {
+        postId: row.id,
+        actor: webId,
+      });
+    } catch (err: any) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error(`[PostSyncWorker] Failed to sync ATProto-only post ${row.id}`, {
+        postId: row.id,
+        attempts: row.sync_attempts + 1,
+        error: errorMsg,
+      });
+
       await pool.query(
         `UPDATE local_cache_posts
          SET sync_attempts = sync_attempts + 1,

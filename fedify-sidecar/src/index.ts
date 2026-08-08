@@ -2218,6 +2218,10 @@ async function main() {
     registerPublicFeedRoutes(app, {
       feedService,
       hydrationService,
+      // postSyncWorker is created later, during background startup — a
+      // getter reads the module variable at request time instead of
+      // capturing its (still-null) value at this registration point.
+      getPostSyncWorker: () => postSyncWorker,
     });
 
     const enableFep3ab2Streaming = (process.env["ENABLE_FEP_3AB2_STREAMING"] ?? "true") !== "false";

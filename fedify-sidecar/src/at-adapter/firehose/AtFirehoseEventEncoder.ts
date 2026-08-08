@@ -15,7 +15,8 @@
  * Ref: https://atproto.com/specs/event-stream
  */
 
-import { encode as encodeCbor } from 'cborg';
+import * as dagCbor from '@ipld/dag-cbor';
+import { CID } from 'multiformats/cid';
 
 export interface FirehoseEventBase {
   seq: number;
@@ -61,7 +62,29 @@ export interface AtFirehoseEventEncoder {
 
 export class DefaultAtFirehoseEventEncoder implements AtFirehoseEventEncoder {
   encodeCommit(evt: CommitFirehoseEvent): Uint8Array {
-    return this._encode('#commit', evt as unknown as Record<string, unknown>);
+    // BUGFIX: `commit` and each op's `cid` are spec'd as CID-links
+    // (https://atproto.com/specs/event-stream#framing), which DAG-CBOR
+    // encodes as CBOR tag 42 (0x2a) around the CID bytes — not as plain
+    // text strings. This file previously encoded them as plain strings
+    // via raw `cborg`, which official relays reject while trying to parse
+    // ops[i].cid ("expected cbor type 'tag' in input"). Converting to real
+    // CID objects and encoding the body with @ipld/dag-cbor (which already
+    // handles CID objects correctly, see ProductionAtCommitVerifier.ts for
+    // the same pattern on the read/verify side) fixes this.
+    const body: Record<string, unknown> = {
+      ...evt,
+      commit: evt.commit ? CID.parse(evt.commit) : evt.commit,
+      // prevData is also a CID-link (the previous commit's MST root) — same
+      // tag-42 requirement as commit/ops[].cid above. `since` stays a plain
+      // string; it's a TID revision, not a CID.
+      prevData: evt.prevData ? CID.parse(evt.prevData) : null,
+      ops: evt.ops.map(op => ({
+        ...op,
+        cid: op.cid ? CID.parse(op.cid) : null
+      }))
+    };
+    delete (body as { $type?: string }).$type;
+    return this._encode('#commit', body);
   }
 
   encodeIdentity(evt: IdentityFirehoseEvent): Uint8Array {
@@ -74,12 +97,14 @@ export class DefaultAtFirehoseEventEncoder implements AtFirehoseEventEncoder {
 
   /**
    * Encodes the event into the ATProto wire format: two concatenated
-   * DRISL-CBOR objects (header map, then body map).
+   * DAG-CBOR objects (header map, then body map). Uses @ipld/dag-cbor
+   * (not raw cborg) so any CID objects in the payload (see encodeCommit)
+   * are correctly encoded as tag-42 CID-links.
    */
   private _encode<T extends { $type?: string } & object>(type: string, body: T): Uint8Array {
     const header = { op: 1, t: type };
     const { $type: _ignoredType, ...payload } = body;
-    return concatBytes(encodeCbor(header), encodeCbor(payload));
+    return concatBytes(dagCbor.encode(header), dagCbor.encode(payload));
   }
 }
 

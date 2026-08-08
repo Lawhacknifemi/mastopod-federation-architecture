@@ -243,6 +243,12 @@ export const HydratedObjectSchema = z.object({
     })
     .strict()
     .optional(),
+  // Which protocol(s) this content actually exists on — used by
+  // GET /at/feed's ?source= filter (see public-routes.ts). Without this
+  // declared here, Zod silently strips it on parse and every item falls
+  // back to being treated as present on both networks, making the filter
+  // a no-op — see OpenSearchHydrator.ts's toHydratedObject for the write side.
+  protocolPresence: z.array(z.enum(["ap", "at"])).optional(),
 });
 
 export const HydrationOmittedReasonSchema = z.enum([

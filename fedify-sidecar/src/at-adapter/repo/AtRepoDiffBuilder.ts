@@ -44,6 +44,28 @@ export class DefaultAtRepoDiffBuilder implements AtRepoDiffBuilder {
       cid: op.cid ?? null
     }));
 
+    // If the event already carries real CAR bytes (e.g. from the native
+    // ActivityPods AT bridge, which builds a real CAR via
+    // helpers/atproto/carfile.js), use them directly rather than emitting
+    // an empty CAR slice — a spec-following relay needs real block bytes
+    // to verify the commit, not just a frame on the wire.
+    if (commit.carSliceBase64) {
+      return {
+        commitCid: commit.commitCid,
+        // BUGFIX: prevData is the previous commit's MST ROOT ("data" field,
+      // per https://atproto.com/specs/sync), not the previous COMMIT
+      // block's own CID (prevCommitCid/the commit's `prev` chain link) —
+      // these are two different CIDs. A relay uses prevData for MST
+      // inversion verification of non-genesis commits and rejects the
+      // event outright ("missing prevData field") if it's wrong/absent.
+      // This conflation predates this session's changes and was never
+      // exercised until a real relay verified a real non-genesis commit.
+      prevData: commit.prevDataCid ?? null,
+        ops,
+        carSlice: new Uint8Array(Buffer.from(commit.carSliceBase64, 'base64'))
+      };
+    }
+
     // In a real implementation, this would use @atproto/repo to build a CAR slice
     // containing the commit block, changed MST nodes, and new/updated record blocks.
     // For Phase 5, we provide a valid empty CAR slice using @ipld/car.
@@ -83,7 +105,15 @@ export class DefaultAtRepoDiffBuilder implements AtRepoDiffBuilder {
 
     return {
       commitCid: commit.commitCid,
-      prevData: commit.prevCommitCid,
+      // BUGFIX: prevData is the previous commit's MST ROOT ("data" field,
+      // per https://atproto.com/specs/sync), not the previous COMMIT
+      // block's own CID (prevCommitCid/the commit's `prev` chain link) —
+      // these are two different CIDs. A relay uses prevData for MST
+      // inversion verification of non-genesis commits and rejects the
+      // event outright ("missing prevData field") if it's wrong/absent.
+      // This conflation predates this session's changes and was never
+      // exercised until a real relay verified a real non-genesis commit.
+      prevData: commit.prevDataCid ?? null,
       ops,
       carSlice
     };

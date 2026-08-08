@@ -207,7 +207,7 @@ main() {
   start_bg_if_needed "ActivityPods backend" 3000 "$LOG_DIR/backend-dev.log" "$PID_DIR/backend.pid" \
     npm --prefix "$AP_ROOT/pod-provider/backend" start
   start_bg_if_needed "ActivityPods frontend" "$FRONTEND_PORT" "$LOG_DIR/frontend-dev.log" "$PID_DIR/frontend.pid" \
-    env BROWSER=none npm --prefix "$AP_ROOT/pod-provider/frontend" run dev
+    env BROWSER=none PORT="$FRONTEND_PORT" npm --prefix "$AP_ROOT/pod-provider/frontend" run dev
   start_bg_if_needed "Fedify sidecar" 8080 "$LOG_DIR/sidecar-dev.log" "$PID_DIR/fedify-sidecar.pid" \
     env PORT=8080 HOST=0.0.0.0 npm --prefix "$FEDIFY_ROOT" run server:dev
   start_bg_if_needed "Media pipeline sidecar" "$MEDIA_PIPELINE_PORT" "$LOG_DIR/media-pipeline-dev.log" "$PID_DIR/media-pipeline-sidecar.pid" \

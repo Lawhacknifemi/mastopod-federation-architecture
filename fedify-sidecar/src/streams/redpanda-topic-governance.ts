@@ -208,8 +208,8 @@ export async function verifyRedpandaTopics(options: TopicGovernanceOptions): Pro
 
       const configEntries = configByTopic.get(topic.topic) ?? new Map<string, string>();
       const compressionType = configEntries.get("compression.type");
-      if (compressionType !== "zstd") {
-        failures.push(`${topic.topic}: compression.type must be zstd (found ${compressionType ?? "unset"})`);
+      if (compressionType !== "producer" && compressionType !== "zstd") {
+        failures.push(`${topic.topic}: compression.type must be producer or zstd (found ${compressionType ?? "unset"})`);
       }
 
       const expectedCleanup = normalizeCleanupPolicy(topic.cleanupPolicy);
@@ -302,7 +302,7 @@ function buildConfigEntries(
   const entries: Array<{ name: string; value: string }> = [
     { name: "cleanup.policy", value: topic.cleanupPolicy },
     { name: "retention.ms", value: String(topic.retentionMs) },
-    { name: "compression.type", value: "zstd" },
+    { name: "compression.type", value: "producer" },
     { name: "min.insync.replicas", value: String(profileSettings.minInSyncReplicas) },
   ];
 

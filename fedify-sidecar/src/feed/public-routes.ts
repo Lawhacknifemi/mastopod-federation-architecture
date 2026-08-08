@@ -7,6 +7,15 @@ import { pool } from "../db/postgres.js";
 export interface PublicFeedRouteDeps {
   feedService: DefaultPodFeedService;
   hydrationService: DefaultPodHydrationService;
+  /**
+   * Returns the running PostSyncWorker, or null if it hasn't started yet.
+   * A getter (not the instance itself) because this module's routes are
+   * registered before the worker is created during background startup —
+   * capturing the instance directly here would freeze on its initial
+   * null value. See POST /at/create-post, which calls triggerNow() on it
+   * after caching a post so sync doesn't wait for the next poll tick.
+   */
+  getPostSyncWorker: () => { triggerNow: () => void } | null;
 }
 
 function parseRequestBody(body: unknown): any {
@@ -986,6 +995,14 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       );
 
       reply.code(201).send({ ok: true, objectUri, targetProtocol: normalizedTargetProtocol });
+
+      // Kick the sync worker now instead of leaving this post to wait for
+      // the next 5s poll tick. Fire-and-forget, after the response is
+      // already sent — the worker's own isTickActive guard keeps this to
+      // the same one-write-in-flight-at-a-time behavior as the periodic
+      // poll, so this doesn't add Fuseki write concurrency, it just
+      // removes idle waiting when nothing else is in flight.
+      deps.getPostSyncWorker()?.triggerNow();
     } catch (err: any) {
       console.error("[create-post] Failed to cache post in PostgreSQL:", err);
       reply.code(500).send({ error: "internal_error", message: `Failed to queue post: ${err.message}` });

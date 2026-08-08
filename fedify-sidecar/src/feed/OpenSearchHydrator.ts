@@ -105,6 +105,12 @@ function toHydratedObject(doc: PublicContentDocument, source: FeedSource): Hydra
       replyCount: clampCount(doc.engagement?.replyCount),
     },
     provenance: { source, discoveredVia: doc.sourceKind },
+    // Carried over from the raw indexed doc so GET /at/feed's ?source=
+    // filter (public-routes.ts) can actually distinguish AP-only /
+    // AT-only / both — without this, every hydrated item comes back with
+    // protocolPresence undefined and the route's fallback treats it as
+    // present on both networks regardless of what's really indexed.
+    protocolPresence: doc.protocolPresence,
   };
 }
 

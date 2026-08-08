@@ -45,6 +45,13 @@ export interface AtCommitV1 {
   rev: string;
   commitCid: string;
   prevCommitCid: string | null;
+  /**
+   * The previous commit's MST root ("data" field) — distinct from
+   * prevCommitCid (the previous commit BLOCK's own CID). Required for a
+   * relay to perform MST inversion verification on non-genesis commits;
+   * see AtRepoDiffBuilder.ts's prevData mapping.
+   */
+  prevDataCid?: string | null;
   repoVersion: 3;
   ops: Array<{
     action: 'create' | 'update' | 'delete';
@@ -62,6 +69,16 @@ export interface AtCommitV1 {
     bridge?: AtRepoBridgeMetadata;
   }>;
   emittedAt: string;
+  /**
+   * Optional base64-encoded CAR v1 slice for this commit, containing the
+   * commit block plus changed MST/record blocks, rooted at `commitCid`.
+   * When present, AtRepoDiffBuilder uses these bytes directly instead of
+   * emitting an empty CAR — populated today by the native ActivityPods
+   * AT bridge (helpers/atproto/atproto.service.js), which builds real CAR
+   * output via helpers/atproto/carfile.js. Absent for events from paths
+   * that don't yet produce real block data (see AtRepoDiffBuilder).
+   */
+  carSliceBase64?: string;
 }
 
 export interface AtEgressV1 {
