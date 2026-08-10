@@ -892,6 +892,31 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       return;
     }
 
+    // Previously always implicitly "all" (AP outbox + whatever the bridge
+    // auto-mirrored) with no way to choose — same capping rule as
+    // replies now applies: a repost can't reach a network its subject
+    // doesn't actually exist on.
+    const requestedTargetProtocol =
+      body.targetProtocol === "atproto" || body.targetProtocol === "at"
+        ? "atproto"
+        : body.targetProtocol === "activitypods" || body.targetProtocol === "ap"
+          ? "activitypods"
+          : "all";
+
+    const subjectScope = await resolveParentScope(subjectUri);
+    let normalizedTargetProtocol: "all" | "activitypods" | "atproto";
+    if (!subjectScope || subjectScope === "all") {
+      normalizedTargetProtocol = requestedTargetProtocol;
+    } else if (requestedTargetProtocol === "all" || requestedTargetProtocol === subjectScope) {
+      normalizedTargetProtocol = subjectScope;
+    } else {
+      reply.code(400).send({
+        error: "invalid_request",
+        message: `This post only exists on ${subjectScope === "activitypods" ? "ActivityPub" : "ATProto"} — can't repost it on ${requestedTargetProtocol === "activitypods" ? "ActivityPub" : "ATProto"}.`
+      });
+      return;
+    }
+
     // Maintain in-memory repost state
     if (!userRepostsMap.has(webId)) {
       userRepostsMap.set(webId, new Set());
@@ -900,54 +925,115 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
     const currentCount = postRepostCountMap.get(subjectUri) || 0;
     postRepostCountMap.set(subjectUri, currentCount + 1);
 
-    try {
-      const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
-      const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
+    const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
+    const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
 
-      // Post Announce to outbox via internal-social-api
-      const response = await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${activityPodsToken}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          actorUri: webId,
-          activity: {
-            "@context": "https://www.w3.org/ns/activitystreams",
-            "type": "Announce",
-            "actor": webId,
-            "object": subjectUri
-          }
-        })
-      });
+    let apRepostUri: string | undefined;
+    let atDelivered = false;
 
-      if (!response.ok) {
-        const text = await response.text();
-        console.warn(`ActivityPods outbox post non-200: ${response.status} ${text}`);
+    if (normalizedTargetProtocol === "all" || normalizedTargetProtocol === "activitypods") {
+      try {
+        const response = await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${activityPodsToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            actorUri: webId,
+            activity: {
+              "@context": "https://www.w3.org/ns/activitystreams",
+              "type": "Announce",
+              "actor": webId,
+              "object": subjectUri,
+              // Without this, activitypub.activity.isPublic() (which
+              // just checks `to` for the Public URI) returns false, and
+              // ActivityPods' own unrelated sharing/announcer.js service
+              // — which reuses the Announce activity TYPE for a totally
+              // different "share access to a resource" feature — matches
+              // on any non-public Announce and rejects it outright
+              // ("Only the creator has the right to share the object"),
+              // since the reposter isn't the original post's creator.
+              // Every repost was silently failing (deleted right after
+              // creation — outbox.js rolls back the activity when a
+              // side-effect handler throws) until this was added.
+              "to": ["https://www.w3.org/ns/activitystreams#Public"]
+            },
+            ...(normalizedTargetProtocol === "activitypods" ? { targetProtocol: "activitypods" } : {})
+          })
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          console.warn(`ActivityPods outbox post non-200: ${response.status} ${text}`);
+        } else {
+          const result = await response.json() as any;
+          apRepostUri = result.activityUri;
+        }
+      } catch (err) {
+        console.error("Repost outbox dispatch error:", err);
       }
-
-      const result = response.ok ? await response.json() as any : {};
-      const activityUri = result.activityUri;
-
-      reply.send({
-        ok: true,
-        subjectUri,
-        repostUri: activityUri || `${webId}/activities/repost-${Date.now()}`,
-        reposted: true
-      });
-    } catch (err) {
-      console.error("Repost non-fatal outbox dispatch warning:", err);
-      reply.send({
-        ok: true,
-        subjectUri,
-        repostUri: `${webId}/activities/repost-${Date.now()}`,
-        reposted: true
-      });
     }
+
+    // Strictly "atproto" only, not "all" — same reasoning as replies: when
+    // the AP branch above ran, that outbox call already triggers the
+    // native bridge's automatic AT mirror, so also calling
+    // atproto-record here would double-write the repost as two
+    // independent AT records.
+    if (normalizedTargetProtocol === "atproto") {
+      try {
+        const subjectUrl = new URL(subjectUri);
+        const subjectActorUri = `${subjectUrl.protocol}//${subjectUrl.host}/${subjectUrl.pathname.replace(/^\//, "").split("/")[0]}`;
+        const subjectCid = await fetchAtRecordCid(activityPodsUrl, activityPodsToken, subjectActorUri, subjectUri);
+
+        if (subjectCid) {
+          const res = await fetch(`${activityPodsUrl}/api/internal/social/atproto-record`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${activityPodsToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              actorUri: webId,
+              collection: "app.bsky.feed.repost",
+              record: {
+                $type: "app.bsky.feed.repost",
+                subject: { uri: subjectUri, cid: subjectCid },
+                createdAt: new Date().toISOString()
+              }
+            })
+          });
+          atDelivered = res.ok;
+          if (!res.ok) {
+            console.error("Repost AT delivery failed:", res.status, await res.text().catch(() => ""));
+          }
+        } else {
+          // Shouldn't normally happen — capping above should have
+          // already rejected this case — but resolveParentScope returns
+          // null (not a hard guarantee) when the subject isn't found in
+          // local_cache_posts at all, so this is a real defensive path,
+          // not dead code.
+          console.warn(`Repost AT delivery skipped — no AT record found for ${subjectUri}`);
+        }
+      } catch (err) {
+        console.error("Repost AT delivery error:", err);
+      }
+    }
+
+    reply.send({
+      ok: true,
+      subjectUri,
+      repostUri: apRepostUri || `${webId}/activities/repost-${Date.now()}`,
+      reposted: true,
+      atDelivered
+    });
   });
 
   // POST /at/reposts/remove - Undo a repost (Undo Announce)
+  // NOTE: same as DELETE /at/like — only undoes the ActivityPub-side
+  // Announce. No AT-side undo yet (would need the created repost
+  // record's rkey tracked somewhere durable); auth here was already
+  // correct before this pass, unlike like's.
   app.post("/at/reposts/remove", async (req, reply) => {
     const webId = await getAuthedWebId(req);
     if (!webId) {
@@ -1265,12 +1351,45 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
 
   // POST /at/like - Like a post
   app.post("/at/like", async (req, reply) => {
-    const authedWebId = (await getAuthedWebId(req)) || "http://activitypods:3000/testuser";
+    const authedWebId = await getAuthedWebId(req);
+    if (!authedWebId) {
+      reply.code(401).send({ error: "unauthorized", message: "Authentication required" });
+      return;
+    }
+
     const body = parseRequestBody(req.body);
-    const { postUri, targetProtocol = "all", actorUri = authedWebId } = body;
+    const { postUri, targetProtocol = "all" } = body;
+    // Always the authenticated caller — the previous version read
+    // actorUri from the request body (defaulting to a hardcoded test
+    // account when auth failed, and client-overridable even when it
+    // didn't), the same impersonation gap /at/reply had.
+    const actorUri = authedWebId;
 
     if (!postUri) {
       reply.code(400).send({ error: "invalid_request", message: "postUri is required" });
+      return;
+    }
+
+    const requestedTargetProtocol =
+      targetProtocol === "atproto" || targetProtocol === "at"
+        ? "atproto"
+        : targetProtocol === "activitypods" || targetProtocol === "ap"
+          ? "activitypods"
+          : "all";
+
+    // Same capping rule as replies/reposts: a like can't reach a network
+    // its subject doesn't actually exist on.
+    const subjectScope = await resolveParentScope(postUri);
+    let normalizedTargetProtocol: "all" | "activitypods" | "atproto";
+    if (!subjectScope || subjectScope === "all") {
+      normalizedTargetProtocol = requestedTargetProtocol;
+    } else if (requestedTargetProtocol === "all" || requestedTargetProtocol === subjectScope) {
+      normalizedTargetProtocol = subjectScope;
+    } else {
+      reply.code(400).send({
+        error: "invalid_request",
+        message: `This post only exists on ${subjectScope === "activitypods" ? "ActivityPub" : "ATProto"} — can't like it on ${requestedTargetProtocol === "activitypods" ? "ActivityPub" : "ATProto"}.`
+      });
       return;
     }
 
@@ -1287,10 +1406,12 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
 
     const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
     const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
+    let atDelivered = false;
 
     try {
-      // 1. ActivityPods Outbox Like Activity
-      if (targetProtocol === "all" || targetProtocol === "activitypods" || targetProtocol === "ap") {
+      // 1. ActivityPub, via the real outbox path — same one every other
+      // create endpoint in this file uses.
+      if (normalizedTargetProtocol === "all" || normalizedTargetProtocol === "activitypods") {
         const likeActivity = {
           "@context": "https://www.w3.org/ns/activitystreams",
           type: "Like",
@@ -1299,43 +1420,71 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
           to: ["https://www.w3.org/ns/activitystreams#Public"]
         };
 
-        await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${activityPodsToken}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ actorUri, activity: likeActivity })
-        }).catch(err => console.error("Outbox Like error:", err));
+        try {
+          const res = await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${activityPodsToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              actorUri,
+              activity: likeActivity,
+              ...(normalizedTargetProtocol === "activitypods" ? { targetProtocol: "activitypods" } : {})
+            })
+          });
+          if (!res.ok) {
+            console.error("Outbox Like failed:", res.status, await res.text().catch(() => ""));
+          }
+        } catch (err) {
+          console.error("Outbox Like error:", err);
+        }
       }
 
-      // 2. ATProto Like Record
-      if (targetProtocol === "all" || targetProtocol === "atproto" || targetProtocol === "at") {
-        const atprotoDid = "did:plc:testuser123";
-        const likeRecord = {
-          $type: "app.bsky.feed.like",
-          subject: {
-            uri: postUri,
-            cid: "bafyreidplaceholder"
-          },
-          createdAt: new Date().toISOString()
-        };
+      // 2. ATProto, via the real atproto-record endpoint with the
+      // subject's real CID — replaces the old call to a route
+      // ActivityPods never mounted (/atproto/... 404'd every time),
+      // a hardcoded fake DID, and a placeholder subject CID. Strictly
+      // "atproto" only, not "all" — see /at/reply and /at/reposts for
+      // why: the AP branch above already triggers the native bridge's
+      // automatic mirror for "all", so calling this too would
+      // double-write the like as two independent AT records.
+      if (normalizedTargetProtocol === "atproto") {
+        try {
+          const postUrl = new URL(postUri);
+          const postActorUri = `${postUrl.protocol}//${postUrl.host}/${postUrl.pathname.replace(/^\//, "").split("/")[0]}`;
+          const subjectCid = await fetchAtRecordCid(activityPodsUrl, activityPodsToken, postActorUri, postUri);
 
-        await fetch(`${activityPodsUrl}/atproto/com.atproto.repo.createRecord`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${activityPodsToken}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            repo: atprotoDid,
-            collection: "app.bsky.feed.like",
-            record: likeRecord
-          })
-        }).catch(err => console.error("ATProto Like Record error:", err));
+          if (subjectCid) {
+            const res = await fetch(`${activityPodsUrl}/api/internal/social/atproto-record`, {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${activityPodsToken}`,
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                actorUri,
+                collection: "app.bsky.feed.like",
+                record: {
+                  $type: "app.bsky.feed.like",
+                  subject: { uri: postUri, cid: subjectCid },
+                  createdAt: new Date().toISOString()
+                }
+              })
+            });
+            atDelivered = res.ok;
+            if (!res.ok) {
+              console.error("ATProto Like failed:", res.status, await res.text().catch(() => ""));
+            }
+          } else {
+            console.warn(`Like AT delivery skipped — no AT record found for ${postUri}`);
+          }
+        } catch (err) {
+          console.error("ATProto Like error:", err);
+        }
       }
 
-      reply.send({ ok: true, liked: true, postUri });
+      reply.send({ ok: true, liked: true, postUri, atDelivered });
     } catch (err) {
       console.error("Like failed:", err);
       reply.code(500).send({ error: "internal_error", message: String(err) });
@@ -1343,10 +1492,21 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
   });
 
   // DELETE /at/like - Unlike a post
+  // NOTE: this only undoes the ActivityPub-side Like. There's no AT-side
+  // undo yet — that needs the created like record's rkey tracked
+  // somewhere durable (atproto.createRecord's return has it, but nothing
+  // persists it today), which is a real, separate gap from the
+  // auth/CID/capping fixes made alongside this. Flagged, not fixed here.
   app.delete("/at/like", async (req, reply) => {
-    const authedWebId = (await getAuthedWebId(req)) || "http://activitypods:3000/testuser";
+    const authedWebId = await getAuthedWebId(req);
+    if (!authedWebId) {
+      reply.code(401).send({ error: "unauthorized", message: "Authentication required" });
+      return;
+    }
+
     const body = parseRequestBody(req.body);
-    const { postUri, targetProtocol = "all", actorUri = authedWebId } = body;
+    const { postUri, targetProtocol = "all" } = body;
+    const actorUri = authedWebId;
 
     if (!postUri) {
       reply.code(400).send({ error: "invalid_request", message: "postUri is required" });
