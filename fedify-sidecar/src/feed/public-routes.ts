@@ -1337,13 +1337,32 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
 
   // POST /at/reply - Reply / Comment on a post
   app.post("/at/reply", async (req, reply) => {
+    const authedWebId = await getAuthedWebId(req);
+    if (!authedWebId) {
+      reply.code(401).send({ error: "unauthorized", message: "Authentication required" });
+      return;
+    }
+
     const body = parseRequestBody(req.body);
-    const { parentUri, text, targetProtocol = "all", actorUri = "http://activitypods:3000/testuser" } = body;
+    const { parentUri, text, targetProtocol = "all" } = body;
+    // The actor is always the authenticated caller — never client-supplied.
+    // The previous version read actorUri from the request body (defaulting
+    // to a hardcoded test account when absent, which the frontend always
+    // hit in practice since it never sent one), so every reply was posted
+    // as that fixed fake actor regardless of who was actually signed in.
+    const actorUri = authedWebId;
 
     if (!parentUri || !text) {
       reply.code(400).send({ error: "invalid_request", message: "parentUri and text are required" });
       return;
     }
+
+    const normalizedTargetProtocol =
+      targetProtocol === "atproto" || targetProtocol === "at"
+        ? "atproto"
+        : targetProtocol === "activitypods" || targetProtocol === "ap"
+          ? "activitypods"
+          : "all";
 
     const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
     const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
@@ -1351,17 +1370,24 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
     try {
       const timestamp = new Date().toISOString();
       const replyId = crypto.randomUUID();
-      const replyNoteId = `${activityPodsUrl}/notes/reply-${Date.now()}`;
+      const username = actorUri.split("/").pop() || "user";
+      const replyNoteId = `${activityPodsUrl}/${username}/data/note/${replyId}`;
 
       // Increment parent reply count in local state
       const currentOffset = postReplyCountMap.get(parentUri) || 0;
       postReplyCountMap.set(parentUri, currentOffset + 1);
 
-      // Save reply post to local_cache_posts table so it appears in feed / thread queries
+      // Save reply to local_cache_posts purely so GET /at/feed's reply-count
+      // / thread queries can see it — actual delivery happens synchronously
+      // below, not via PostSyncWorker. Marked synced immediately: leaving
+      // this FALSE (as before) meant PostSyncWorker's own poll query would
+      // pick the row up ~seconds later and repost it as an unrelated,
+      // non-reply top-level Note (its SELECT doesn't even include
+      // in_reply_to), duplicating every reply as a phantom standalone post.
       await pool.query(
         `INSERT INTO local_cache_posts (
           id, actor_uri, content, post_type, name, summary, hashtags, attachments, target_protocol, in_reply_to, synced_to_fuseki
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE)`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)`,
         [
           replyId,
           actorUri,
@@ -1371,19 +1397,29 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
           null,
           [],
           JSON.stringify([]),
-          targetProtocol === "atproto" || targetProtocol === "activitypods" ? targetProtocol : "all",
+          normalizedTargetProtocol,
           parentUri
         ]
       ).catch(err => console.error("Failed to insert reply into local_cache_posts:", err));
 
-      // 1. ActivityPods Outbox Reply Note
-      if (targetProtocol === "all" || targetProtocol === "activitypods" || targetProtocol === "ap") {
+      let apDelivered = false;
+      // atDelivered reflects only the explicit atproto-post call below,
+      // which fires for "atproto"-only replies. For "all", the AT side is
+      // delivered implicitly via the native bridge's automatic mirror of
+      // the AP outbox call — real, but not confirmed by this endpoint,
+      // same as /at/create-post's response never confirms it either.
+      let atDelivered = false;
+
+      // 1. ActivityPub reply, via the real, proven outbox path (same one
+      // /at/create-post uses) — not a hand-rolled fetch to a made-up shape.
+      if (normalizedTargetProtocol === "all" || normalizedTargetProtocol === "activitypods") {
         const noteActivity = {
           "@context": "https://www.w3.org/ns/activitystreams",
           type: "Create",
           actor: actorUri,
+          to: ["https://www.w3.org/ns/activitystreams#Public"],
           object: {
-            id: replyNoteId,
+            "@id": replyNoteId,
             type: "Note",
             attributedTo: actorUri,
             content: text,
@@ -1393,48 +1429,66 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
           }
         };
 
-        await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${activityPodsToken}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({ actorUri, activity: noteActivity })
-        }).catch(err => console.error("Outbox Reply Note error:", err));
+        try {
+          const res = await fetch(`${activityPodsUrl}/api/internal/social/outbox`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${activityPodsToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              actorUri,
+              activity: noteActivity,
+              ...(normalizedTargetProtocol === "activitypods" ? { targetProtocol: "activitypods" } : {})
+            })
+          });
+          apDelivered = res.ok;
+          if (!res.ok) {
+            console.error("Reply AP delivery failed:", res.status, await res.text().catch(() => ""));
+          }
+        } catch (err) {
+          console.error("Reply AP delivery error:", err);
+        }
       }
 
-      // 2. ATProto Reply Record
-      if (targetProtocol === "all" || targetProtocol === "atproto" || targetProtocol === "at") {
-        const atprotoDid = "did:plc:testuser123";
-        const replyRecord = {
-          $type: "app.bsky.feed.post",
-          text,
-          reply: {
-            root: { uri: parentUri, cid: "bafyreidplaceholder" },
-            parent: { uri: parentUri, cid: "bafyreidplaceholder" }
-          },
-          createdAt: timestamp
-        };
-
-        await fetch(`${activityPodsUrl}/atproto/com.atproto.repo.createRecord`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${activityPodsToken}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            repo: atprotoDid,
-            collection: "app.bsky.feed.post",
-            record: replyRecord
-          })
-        }).catch(err => console.error("ATProto Reply Record error:", err));
+      // 2. ATProto reply, via the real atproto-post endpoint (same one
+      // used for ATProto-only top-level posts) — not the old call to a
+      // route ActivityPods never actually mounted (/atproto/... 404'd
+      // every time) with a hardcoded fake DID.
+      //
+      // Strictly "atproto" only, not "all": when the AP branch above ran
+      // (targetProtocol "all"), that outbox call already triggers the
+      // native bridge's automatic AT mirror (same as every top-level
+      // "all" post — see PostSyncWorker.syncPost, which never calls this
+      // endpoint for "all" either), so also calling atproto-post here
+      // would double-write the same reply as two independent AT records.
+      // First-pass testing against real Fuseki data is what caught this.
+      if (normalizedTargetProtocol === "atproto") {
+        try {
+          const res = await fetch(`${activityPodsUrl}/api/internal/social/atproto-post`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${activityPodsToken}`,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ actorUri, content: text, replyToUri: parentUri })
+          });
+          atDelivered = res.ok;
+          if (!res.ok) {
+            console.error("Reply AT delivery failed:", res.status, await res.text().catch(() => ""));
+          }
+        } catch (err) {
+          console.error("Reply AT delivery error:", err);
+        }
       }
 
       reply.send({
         ok: true,
         replyUri: replyNoteId,
         parentUri,
-        text
+        text,
+        apDelivered,
+        atDelivered
       });
     } catch (err) {
       console.error("Reply failed:", err);
