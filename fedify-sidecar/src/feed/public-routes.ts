@@ -18,6 +18,40 @@ export interface PublicFeedRouteDeps {
   getPostSyncWorker: () => { triggerNow: () => void } | null;
 }
 
+/**
+ * Resolves a signed-in/signed-up account's real atprotoDid/atprotoHandle
+ * via ActivityPods' internal identity-projection API, for embedding in the
+ * /at/auth/login and /at/auth/signup responses.
+ *
+ * Fails open (returns nulls) rather than failing the whole login/signup —
+ * the DID is a nice-to-have for the frontend session, not a login
+ * precondition. This is the credentials-based counterpart to
+ * atproto-identity-api.service.js's GET /.well-known/atproto-identity
+ * (used by the separate OIDC sign-in fallback in oidc.ts) — that route
+ * needs a browser-held OIDC token, which this server-to-server call
+ * doesn't have, so it goes through the internal bearer-token API instead.
+ */
+async function fetchAtprotoIdentity(
+  activityPodsUrl: string,
+  activityPodsToken: string,
+  canonicalAccountId: string
+): Promise<{ atprotoDid: string | null; atprotoHandle: string | null }> {
+  try {
+    const res = await fetch(
+      `${activityPodsUrl}/api/internal/identity/by-canonical-account-id?canonicalAccountId=${encodeURIComponent(canonicalAccountId)}`,
+      { headers: { Authorization: `Bearer ${activityPodsToken}` } }
+    );
+    if (!res.ok) return { atprotoDid: null, atprotoHandle: null };
+    const projection = (await res.json()) as any;
+    return {
+      atprotoDid: projection.atprotoDid || null,
+      atprotoHandle: projection.atprotoHandle || null
+    };
+  } catch {
+    return { atprotoDid: null, atprotoHandle: null };
+  }
+}
+
 function parseRequestBody(body: unknown): any {
   if (typeof body === "string") {
     try {
@@ -1048,12 +1082,15 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
 
       const result = await response.json() as any;
       if (result.ok && result.token) {
-        // Fetch actor profile info
-        const actorResponse = await fetch(`${activityPodsUrl}/api/internal/social/actor?actorUri=${encodeURIComponent(canonicalAccountId)}`, {
-          headers: {
-            "Authorization": `Bearer ${activityPodsToken}`
-          }
-        });
+        // Fetch actor profile info and the real atprotoDid in parallel —
+        // two independent lookups, not a dependency chain, so this adds
+        // no latency beyond whichever one is slower.
+        const [actorResponse, identity] = await Promise.all([
+          fetch(`${activityPodsUrl}/api/internal/social/actor?actorUri=${encodeURIComponent(canonicalAccountId)}`, {
+            headers: { "Authorization": `Bearer ${activityPodsToken}` }
+          }),
+          fetchAtprotoIdentity(activityPodsUrl, activityPodsToken, canonicalAccountId)
+        ]);
 
         let userProfile: any = {};
         if (actorResponse.ok) {
@@ -1065,7 +1102,9 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
           user: {
             webId: canonicalAccountId,
             name: userProfile.name || username,
-            handle: userProfile.preferredUsername || username
+            handle: userProfile.preferredUsername || username,
+            atprotoDid: identity.atprotoDid,
+            atprotoHandle: identity.atprotoHandle
           }
         });
       } else {
@@ -1136,12 +1175,18 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       if (loginResponse.ok) {
         const loginResult = await loginResponse.json() as any;
         if (loginResult.ok && loginResult.token) {
+          // The DID is minted synchronously as part of the signup hook
+          // that already completed above (see auth.js's after.signup),
+          // so it's safe to look up immediately here — no race.
+          const identity = await fetchAtprotoIdentity(activityPodsUrl, activityPodsToken, canonicalAccountId);
           reply.send({
             token: loginResult.token,
             user: {
               webId: canonicalAccountId,
               name: username,
-              handle: username
+              handle: username,
+              atprotoDid: identity.atprotoDid,
+              atprotoHandle: identity.atprotoHandle
             }
           });
           return;
