@@ -82,6 +82,36 @@ async function fetchAtRecordCid(
   }
 }
 
+/**
+ * Resolves which network(s) a post actually exists on — 'all',
+ * 'activitypods', or 'atproto' — by looking up its own target_protocol in
+ * local_cache_posts (every post and reply made through this system gets a
+ * row there with the value it was actually created with; see
+ * POST /at/create-post and POST /at/reply's own insert below).
+ *
+ * Used by POST /at/reply to cap a reply's actual delivery to whatever
+ * network(s) its parent is really on — a reply to an ActivityPub-only
+ * post should never spawn a standalone record on ATProto (or vice
+ * versa), even if the replier asked for "all". Returns null if the
+ * parent isn't found (e.g. it was created by something other than this
+ * system's own endpoints) — callers should treat that as "unknown,
+ * don't additionally constrain" rather than block the reply.
+ */
+async function resolveParentScope(parentUri: string): Promise<"all" | "activitypods" | "atproto" | null> {
+  try {
+    const parentId = new URL(parentUri).pathname.split("/").filter(Boolean).pop();
+    if (!parentId) return null;
+    const { rows } = await pool.query(
+      `SELECT target_protocol FROM local_cache_posts WHERE id = $1 LIMIT 1`,
+      [parentId]
+    );
+    const value = rows[0]?.target_protocol;
+    return value === "activitypods" || value === "atproto" ? value : value === "all" ? "all" : null;
+  } catch {
+    return null;
+  }
+}
+
 function parseRequestBody(body: unknown): any {
   if (typeof body === "string") {
     try {
@@ -1387,12 +1417,33 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       return;
     }
 
-    const normalizedTargetProtocol =
+    const requestedTargetProtocol =
       targetProtocol === "atproto" || targetProtocol === "at"
         ? "atproto"
         : targetProtocol === "activitypods" || targetProtocol === "ap"
           ? "activitypods"
           : "all";
+
+    // A reply can never reach a network its parent doesn't actually exist
+    // on — replying "all" to an ActivityPub-only post must not spawn a
+    // standalone, unthreaded record on ATProto (or vice versa). Cap the
+    // requested protocol to the parent's real scope; if they don't
+    // overlap at all (e.g. an ATProto-only reply to an ActivityPub-only
+    // post), that's not a degraded case to silently handle — it's an
+    // impossible request, and we say so rather than doing nothing.
+    const parentScope = await resolveParentScope(parentUri);
+    let normalizedTargetProtocol: "all" | "activitypods" | "atproto";
+    if (!parentScope || parentScope === "all") {
+      normalizedTargetProtocol = requestedTargetProtocol;
+    } else if (requestedTargetProtocol === "all" || requestedTargetProtocol === parentScope) {
+      normalizedTargetProtocol = parentScope;
+    } else {
+      reply.code(400).send({
+        error: "invalid_request",
+        message: `This post only exists on ${parentScope === "activitypods" ? "ActivityPub" : "ATProto"} — can't reply to it on ${requestedTargetProtocol === "activitypods" ? "ActivityPub" : "ATProto"}.`
+      });
+      return;
+    }
 
     const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
     const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
