@@ -72,6 +72,8 @@ export interface AtXrpcServerDeps {
   handleResolutionReader: HandleResolutionReader;
   firehoseSubscriptions: AtFirehoseSubscriptionManager;
   repoRegistry: AtprotoRepoRegistry;
+  /** Used by describeRepo to query ActivityPods' real collections list directly. */
+  activityPodsUrl: string;
   /** Optional: enables handleIsCorrect round-trip in describeRepo */
   identityRepo?: IdentityBindingRepository;
   // Phase 7: write + session deps (optional — omit to disable write endpoints)
@@ -215,7 +217,7 @@ export class DefaultAtXrpcServer implements AtXrpcServer {
       : null;
 
     this.describeRepoRoute = new RepoDescribeRepoRoute(
-      deps.repoRegistry,
+      deps.activityPodsUrl,
       deps.handleResolutionReader,
       deps.identityRepo,
       deps.externalReadGateway,

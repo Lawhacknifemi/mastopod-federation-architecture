@@ -43,6 +43,95 @@ export interface AtRecordReader {
   listRecords(input: ListRecordsInput): Promise<ListRecordsResult>;
 }
 
+/**
+ * Reads records from ActivityPods' real atproto.getRecord/listRecords
+ * actions (backed by Fuseki, the actual durable store) instead of the
+ * Redis-backed AtAliasStore/AtprotoRepoRegistry, which are only ever
+ * populated by the legacy Kafka-based AP<->AT bridge — dead in practice
+ * since the native in-process bridge (built this session) bypasses it
+ * entirely. getRecord/listRecords were structurally correct but reading
+ * from a store nothing durable ever wrote to, so every lookup for
+ * anything created via the real write path came back empty regardless
+ * of whether the record actually existed.
+ */
+export class ActivityPodsAtRecordReader implements AtRecordReader {
+  constructor(
+    private readonly handleResolver: HandleResolutionReader,
+    private readonly activityPodsUrl: string,
+  ) {}
+
+  async getRecord(
+    repo: string,
+    collection: string,
+    rkey: string,
+    cid?: string
+  ): Promise<AtStoredRecord | null> {
+    const resolved = await this.handleResolver.resolveRepoInput(repo);
+    if (!resolved) return null;
+
+    try {
+      const res = await fetch(
+        `${this.activityPodsUrl}/atproto/record/${encodeURIComponent(resolved.did)}/${encodeURIComponent(collection)}/${encodeURIComponent(rkey)}`
+      );
+      if (!res.ok) return null;
+      const body = (await res.json()) as any;
+      if (!body?.cid) return null;
+
+      // CID pinning: if a specific CID was requested, verify it matches.
+      if (cid && body.cid !== cid) return null;
+
+      return {
+        did: resolved.did,
+        collection,
+        rkey,
+        uri: body.uri || `at://${resolved.did}/${collection}/${rkey}`,
+        cid: body.cid,
+        value: body.value ?? { $type: collection },
+        indexedAt: body.createdAt || new Date().toISOString()
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async listRecords(input: ListRecordsInput): Promise<ListRecordsResult> {
+    const resolved = await this.handleResolver.resolveRepoInput(input.repo);
+    if (!resolved) {
+      throw new Error(`Repo not found: ${input.repo}`);
+    }
+
+    try {
+      const params = new URLSearchParams();
+      if (input.limit) params.set("limit", String(input.limit));
+      if (input.cursor) params.set("cursor", input.cursor);
+      if (input.reverse) params.set("reverse", "true");
+
+      const res = await fetch(
+        `${this.activityPodsUrl}/atproto/record/${encodeURIComponent(resolved.did)}/${encodeURIComponent(input.collection)}?${params.toString()}`
+      );
+      if (!res.ok) return { records: [] };
+
+      const body = (await res.json()) as any;
+      const records: AtStoredRecord[] = (body.records || []).map((r: any) => ({
+        did: resolved.did,
+        collection: input.collection,
+        rkey: r.rkey,
+        uri: r.uri,
+        cid: r.cid,
+        value: r.value ?? { $type: input.collection },
+        indexedAt: r.createdAt || new Date().toISOString()
+      }));
+
+      return {
+        records,
+        cursor: body.cursor || undefined
+      };
+    } catch {
+      return { records: [] };
+    }
+  }
+}
+
 export class DefaultAtRecordReader implements AtRecordReader {
   constructor(
     private readonly handleResolver: HandleResolutionReader,

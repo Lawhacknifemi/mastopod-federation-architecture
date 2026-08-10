@@ -4,14 +4,17 @@
  * Returns basic information about a repository: DID, handle, collections
  * present, and account status.  Unauthenticated.
  *
- * This route is read-only and delegates to the existing AtprotoRepoRegistry
- * and HandleResolutionReader from Phase 4.  No new write-path dependencies.
- *
  * Ref: https://atproto.com/lexicon/com-atproto-repo#comatprotorepoDescribeRepo
+ *
+ * `collections` used to come from AtprotoRepoRegistry (Redis, populated
+ * only by the dead legacy Kafka AP<->AT bridge — same staleness
+ * getRecord/listRecords had, see ActivityPodsAtRecordReader) and fell
+ * back to a generic default list whenever that was empty, which in
+ * practice was always. Now queries ActivityPods' real
+ * atproto.listCollections action directly.
  */
 
 import { XrpcErrors } from '../middleware/XrpcErrorMapper.js';
-import type { AtprotoRepoRegistry } from '../../../atproto/repo/AtprotoRepoRegistry.js';
 import type { HandleResolutionReader } from '../../identity/HandleResolutionReader.js';
 import { SUPPORTED_COLLECTIONS } from '../../writes/AtWriteTypes.js';
 import type { IdentityBindingRepository } from '../../../core-domain/identity/IdentityBindingRepository.js';
@@ -33,11 +36,22 @@ export interface RepoDescribeRepoResponse {
 
 export class RepoDescribeRepoRoute {
   constructor(
-    private readonly repoRegistry: AtprotoRepoRegistry,
+    private readonly activityPodsUrl: string,
     private readonly handleResolver: HandleResolutionReader,
     private readonly identityRepo?: IdentityBindingRepository,
     private readonly externalReadGateway?: ExternalReadGateway,
   ) {}
+
+  private async fetchRealCollections(did: string): Promise<string[]> {
+    try {
+      const res = await fetch(`${this.activityPodsUrl}/atproto/collections/${encodeURIComponent(did)}`);
+      if (!res.ok) return [];
+      const body = (await res.json()) as any;
+      return Array.isArray(body?.collections) ? body.collections : [];
+    } catch {
+      return [];
+    }
+  }
 
   async handle(
     repo: string | undefined
@@ -51,9 +65,6 @@ export class RepoDescribeRepoRoute {
     if (!resolved) {
       throw XrpcErrors.repoNotFound(repo.trim());
     }
-
-    // Look up current repo state
-    const repoState = await this.repoRegistry.getRepoState(resolved.did);
 
     // Optionally enrich with identity binding data when repository wiring provides it.
     const binding = this.identityRepo
@@ -83,24 +94,11 @@ export class RepoDescribeRepoRoute {
       ? (await this.handleResolver.resolveHandle(resolvedHandle)) === resolved.did
       : false;
 
-    // Collections present are those in repository state; normalize object and
-    // string forms, then fall back to supported defaults when empty.
-    const knownCollections = Array.isArray(repoState?.collections)
-      ? repoState.collections
-          .map((collection: unknown) => {
-            if (typeof collection === 'string') return collection;
-            if (
-              collection &&
-              typeof collection === 'object' &&
-              'nsid' in collection &&
-              typeof (collection as { nsid: unknown }).nsid === 'string'
-            ) {
-              return (collection as { nsid: string }).nsid;
-            }
-            return null;
-          })
-          .filter((collection): collection is string => Boolean(collection))
-      : [];
+    // Real collections this repo actually has records in, queried
+    // directly from Fuseki — falls back to the supported-defaults list
+    // only when the repo genuinely has nothing yet (a brand new account),
+    // not as a silent substitute for a store that was never populated.
+    const knownCollections = await this.fetchRealCollections(resolved.did);
 
     const collections = knownCollections.length > 0
       ? [...new Set(knownCollections)]
