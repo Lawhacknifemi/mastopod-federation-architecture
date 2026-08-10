@@ -133,7 +133,6 @@ export class DefaultAtXrpcServer implements AtXrpcServer {
     this.getRepoRoute = new SyncGetRepoRoute({
       carExporter: deps.carExporter,
       handleResolutionReader: deps.handleResolutionReader,
-      repoRegistry: deps.repoRegistry,
       identityRepo: deps.identityRepo,
       externalReadGateway: deps.externalReadGateway,
     });

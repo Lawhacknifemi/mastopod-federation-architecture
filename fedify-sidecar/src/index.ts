@@ -85,7 +85,7 @@ import { RedisIdentityBindingRepository } from "./core-domain/identity/RedisIden
 import { RedisAtAliasStore } from "./at-adapter/repo/AtAliasStore.js";
 import { RedisAtprotoRepoRegistry } from "./atproto/repo/AtprotoRepoRegistry.js";
 import { ActivityPodsAtRecordReader } from "./at-adapter/repo/AtRecordReader.js";
-import { DefaultAtCarExporter } from "./at-adapter/repo/AtCarExporter.js";
+import { ActivityPodsAtCarExporter } from "./at-adapter/repo/AtCarExporter.js";
 import { DefaultAtRkeyService } from "./at-adapter/repo/AtRkeyService.js";
 import { DefaultAtRecordRefResolver } from "./at-adapter/repo/AtRecordRefResolver.js";
 import { DefaultAtTargetAliasResolver } from "./at-adapter/repo/AtTargetAliasResolver.js";
@@ -2873,19 +2873,17 @@ async function main() {
         const handleResolutionReader = new DefaultHandleResolutionReader(identityRepo);
 
         // ---- Record reader + CAR exporter ----
-        // getRecord/listRecords now read ActivityPods' real Fuseki-backed
-        // atproto.getRecord/listRecords actions directly, not aliasStore/
+        // getRecord/listRecords/getRepo now all read ActivityPods' real
+        // Fuseki-backed atproto actions directly, not aliasStore/
         // repoRegistry (Redis, populated only by the dead legacy Kafka
-        // bridge — see ActivityPodsAtRecordReader's own comment). Repo CAR
-        // export (com.atproto.sync.getRepo, via carExporter below) has the
-        // same underlying staleness but is a separate, larger fix — it
-        // needs a full repo snapshot, not single-record lookups — and is
-        // out of scope for this pass.
+        // bridge — see ActivityPodsAtRecordReader's own comment).
         const recordReader = new ActivityPodsAtRecordReader(
           handleResolutionReader,
           process.env["ACTIVITYPODS_URL"] ?? "http://localhost:3000",
         );
-        const carExporter = new DefaultAtCarExporter(repoRegistry);
+        const carExporter = new ActivityPodsAtCarExporter(
+          process.env["ACTIVITYPODS_URL"] ?? "http://localhost:3000",
+        );
 
         // ---- Firehose ----
         const firehoseCursorStore   = new RedisAtFirehoseCursorStore(atRedis, {

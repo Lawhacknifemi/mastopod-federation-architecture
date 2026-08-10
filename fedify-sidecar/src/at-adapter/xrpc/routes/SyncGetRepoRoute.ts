@@ -16,7 +16,6 @@
 
 import { AtCarExporter } from '../../repo/AtCarExporter.js';
 import { HandleResolutionReader, isValidDid } from '../../identity/HandleResolutionReader.js';
-import { AtprotoRepoRegistry } from '../../../atproto/repo/AtprotoRepoRegistry.js';
 import { XrpcErrors } from '../middleware/XrpcErrorMapper.js';
 import type { IdentityBindingRepository } from '../../../core-domain/identity/IdentityBindingRepository.js';
 import type { ExternalReadGateway } from '../../external/ExternalReadGateway.js';
@@ -25,7 +24,6 @@ import { isExternalAtprotoBinding } from '../../external/ExternalAccountMode.js'
 export interface SyncGetRepoRouteDeps {
   carExporter: AtCarExporter;
   handleResolutionReader: HandleResolutionReader;
-  repoRegistry: AtprotoRepoRegistry;
   identityRepo?: IdentityBindingRepository;
   externalReadGateway?: ExternalReadGateway;
 }
@@ -83,14 +81,18 @@ export class SyncGetRepoRoute {
       );
     }
 
-    // 5. Check repo status — only serve active repos.
-    const repoState = await this.deps.repoRegistry.getByDid(resolved.did);
-    if (!repoState) {
+    // 5. Export CAR. carExporter itself is the real existence check now
+    // (it queries ActivityPods for the repo's actual latest commit) — the
+    // separate repoRegistry pre-check this used to do gated on the same
+    // stale Redis store getRecord/listRecords/describeRepo did, and would
+    // reject every repo created via the native write path before the
+    // export was even attempted.
+    let carBytes: Uint8Array;
+    try {
+      carBytes = await this.deps.carExporter.exportRepo(resolved.did);
+    } catch {
       throw XrpcErrors.repoNotFound(resolved.did);
     }
-
-    // 6. Export CAR.
-    const carBytes = await this.deps.carExporter.exportRepo(resolved.did);
 
     return {
       headers: { 'Content-Type': 'application/vnd.ipld.car' },

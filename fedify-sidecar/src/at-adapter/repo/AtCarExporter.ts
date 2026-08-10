@@ -24,6 +24,44 @@ export interface AtCarExporter {
   exportRepo(did: string, since?: string): Promise<Uint8Array>;
 }
 
+/**
+ * Real CAR export via ActivityPods' atproto.getCheckout action — the same
+ * Repo.getCheckout() method that already builds real CAR bytes for every
+ * commit published to the firehose (see AtRepoDiffBuilder.ts's use of
+ * carSliceBase64), just exposed for a full-repo request instead of a
+ * single-commit delta. Replaces DefaultAtCarExporter below, which always
+ * returned an empty CAR regardless of what the repo actually contained.
+ */
+export class ActivityPodsAtCarExporter implements AtCarExporter {
+  constructor(private readonly activityPodsUrl: string) {}
+
+  async exportRepo(did: string, since?: string): Promise<Uint8Array> {
+    if (!did || !isValidDid(did)) {
+      throw new Error(`Invalid DID: ${did}`);
+    }
+
+    // Same Phase 4 scope note as before: incremental "since" export isn't
+    // implemented (Repo.getCheckout() always builds from every block
+    // currently stored, not a diff against a prior rev).
+    if (since !== undefined && since !== '') {
+      throw new Error(
+        'Partial CAR export via "since" is not supported in this version. ' +
+        'Fetch the full repo and use getLatestCommit to detect staleness.'
+      );
+    }
+
+    const res = await fetch(`${this.activityPodsUrl}/atproto/checkout/${encodeURIComponent(did)}`);
+    if (!res.ok) {
+      throw new Error(`Repo not found: ${did}`);
+    }
+    const body = (await res.json()) as any;
+    if (!body?.carBase64) {
+      throw new Error(`Repo not found: ${did}`);
+    }
+    return new Uint8Array(Buffer.from(body.carBase64, 'base64'));
+  }
+}
+
 export class DefaultAtCarExporter implements AtCarExporter {
   constructor(private readonly repoRegistry: AtprotoRepoRegistry) {}
 
