@@ -52,6 +52,36 @@ async function fetchAtprotoIdentity(
   }
 }
 
+/**
+ * Resolves the real AT record CID for a given ActivityPub object URI, via
+ * ActivityPods' GET /record-cid (backed by the canonicalRefId correlation
+ * atproto.createRecord stores). Used by POST /at/reply to build a proper
+ * strongRef {uri, cid} for the ATProto side of a reply, instead of a
+ * placeholder CID a real relay/AppView has no way to verify.
+ *
+ * Returns null (not an error) when the parent's author has no DID, or no
+ * AT record was ever created for that URI (e.g. it's AP-only) — callers
+ * should treat that as "post as standalone on AT", not retry.
+ */
+async function fetchAtRecordCid(
+  activityPodsUrl: string,
+  activityPodsToken: string,
+  parentActorUri: string,
+  canonicalRefId: string
+): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `${activityPodsUrl}/api/internal/social/record-cid?actorUri=${encodeURIComponent(parentActorUri)}&canonicalRefId=${encodeURIComponent(canonicalRefId)}`,
+      { headers: { Authorization: `Bearer ${activityPodsToken}` } }
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as any;
+    return body.cid || null;
+  } catch {
+    return null;
+  }
+}
+
 function parseRequestBody(body: unknown): any {
   if (typeof body === "string") {
     try {
@@ -1465,13 +1495,35 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       // First-pass testing against real Fuseki data is what caught this.
       if (normalizedTargetProtocol === "atproto") {
         try {
+          // A reply strongRef needs the parent's real record CID, not
+          // just its URI — resolve it via the parent author's own
+          // canonicalRefId-tagged AT record. If nothing resolves (parent
+          // was never mirrored to AT — e.g. it's AP-only), replyToCid is
+          // omitted and postAtprotoOnly posts this as a standalone
+          // record rather than shipping a strongRef with a fake CID.
+          let parentCid: string | null = null;
+          try {
+            const parentUrl = new URL(parentUri);
+            const parentActorUri = `${parentUrl.protocol}//${parentUrl.host}/${parentUrl.pathname.replace(/^\//, "").split("/")[0]}`;
+            parentCid = await fetchAtRecordCid(activityPodsUrl, activityPodsToken, parentActorUri, parentUri);
+          } catch (err) {
+            console.error("Reply parent CID resolution error:", err);
+          }
+
           const res = await fetch(`${activityPodsUrl}/api/internal/social/atproto-post`, {
             method: "POST",
             headers: {
               "Authorization": `Bearer ${activityPodsToken}`,
               "Content-Type": "application/json"
             },
-            body: JSON.stringify({ actorUri, content: text, replyToUri: parentUri })
+            body: JSON.stringify({
+              actorUri,
+              content: text,
+              replyToUri: parentUri,
+              ...(parentCid ? { replyToCid: parentCid } : {}),
+              // Lets a future reply to THIS reply resolve its real CID too.
+              canonicalRefId: replyNoteId
+            })
           });
           atDelivered = res.ok;
           if (!res.ok) {

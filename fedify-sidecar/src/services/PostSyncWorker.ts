@@ -244,6 +244,13 @@ export class PostSyncWorker {
     const activityPodsUrl = activityPodsConfig.url.replace(/\/$/, "");
     const activityPodsToken = activityPodsConfig.token;
     const webId = row.actor_uri;
+    const username = webId.split("/").pop() || "user";
+    // Same URI shape /at/create-post returns regardless of target
+    // protocol — this is what a reply's parentUri will actually be, so
+    // storing it as canonicalRefId is what lets a later reply resolve
+    // this post's real record CID (see atproto.createRecord's
+    // canonicalRefId param and GET /record-cid).
+    const objectUri = `${activityPodsUrl}/${username}/data/note/${row.id}`;
 
     const tags = (row.hashtags || []).map((tag: string) => ({
       type: "Hashtag",
@@ -265,6 +272,7 @@ export class PostSyncWorker {
           content: row.content || "",
           tags: tags.length > 0 ? tags : undefined,
           attachments: attachments.length > 0 ? attachments : undefined,
+          canonicalRefId: objectUri,
         }),
       });
 
