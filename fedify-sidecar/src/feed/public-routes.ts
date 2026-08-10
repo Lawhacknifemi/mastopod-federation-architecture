@@ -132,12 +132,15 @@ function stringToNumericId(str: string): number {
   return Math.abs(hash);
 }
 
-// In-memory persistent like, reply & repost tracking maps
-const userLikesMap = new Map<string, Set<string>>();
-const postLikeCountMap = new Map<string, number>();
-const postReplyCountMap = new Map<string, number>();
-const userRepostsMap = new Map<string, Set<string>>();
-const postRepostCountMap = new Map<string, number>();
+// Like/repost engagement is durable now — see post_engagements in
+// db/postgres.ts. This used to be a set of in-memory Maps: real counts
+// and viewer-liked/reposted state, with no fallback of any kind, wiped
+// by every process restart (nothing ever actually populated the
+// OpenSearch-indexed engagement.likeCount/repostCount fields this was
+// nominally layered on top of — see PublicContentIndexWriter.ts's
+// likeDelta/repostDelta handling; nothing anywhere produces an event
+// with those fields — so baseCount was always 0 in practice and these
+// Maps were the entire real signal, not a cache of one).
 
 function extractRawId(uri: string): string | undefined {
   if (!uri) return undefined;
@@ -145,75 +148,84 @@ function extractRawId(uri: string): string | undefined {
   return lastSegment.replace(/-/g, "").toLowerCase();
 }
 
-function isPostLikedByUser(webId: string | undefined, postUri: string): boolean {
+async function isPostLikedByUser(webId: string | undefined, postUri: string): Promise<boolean> {
   if (!webId || !postUri) return false;
-  const userLikes = userLikesMap.get(webId);
-  if (!userLikes) return false;
-  if (userLikes.has(postUri)) return true;
-
   const rawId = extractRawId(postUri);
   if (!rawId) return false;
-  for (const uri of userLikes) {
-    if (extractRawId(uri) === rawId) return true;
-  }
-  return false;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM post_engagements WHERE actor_uri = $1 AND subject_raw_id = $2 AND kind = 'like' LIMIT 1`,
+    [webId, rawId]
+  );
+  return rows.length > 0;
 }
 
-function getPostLikeCount(postUri: string, baseCount: number): number {
-  if (!postUri) return Math.max(0, baseCount);
-  let offset = postLikeCountMap.get(postUri) || 0;
-  if (offset === 0) {
-    const rawId = extractRawId(postUri);
-    if (rawId) {
-      for (const [key, count] of postLikeCountMap.entries()) {
-        if (extractRawId(key) === rawId) {
-          offset = count;
-          break;
-        }
-      }
-    }
-  }
-  return Math.max(0, baseCount + offset);
+async function getPostLikeCount(postUri: string): Promise<number> {
+  if (!postUri) return 0;
+  const rawId = extractRawId(postUri);
+  if (!rawId) return 0;
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) as cnt FROM post_engagements WHERE subject_raw_id = $1 AND kind = 'like'`,
+    [rawId]
+  );
+  return parseInt(rows[0]?.cnt || "0", 10);
 }
 
-function isPostRepostedByUser(webId: string | undefined, postUri: string): boolean {
+async function isPostRepostedByUser(webId: string | undefined, postUri: string): Promise<boolean> {
   if (!webId || !postUri) return false;
-  const userReposts = userRepostsMap.get(webId);
-  if (!userReposts) return false;
-  if (userReposts.has(postUri)) return true;
-
   const rawId = extractRawId(postUri);
   if (!rawId) return false;
-  for (const uri of userReposts) {
-    if (extractRawId(uri) === rawId) return true;
-  }
-  return false;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM post_engagements WHERE actor_uri = $1 AND subject_raw_id = $2 AND kind = 'repost' LIMIT 1`,
+    [webId, rawId]
+  );
+  return rows.length > 0;
 }
 
-function getPostRepostCount(postUri: string, baseCount: number): number {
-  if (!postUri) return Math.max(0, baseCount);
-  let offset = postRepostCountMap.get(postUri) || 0;
-  if (offset === 0) {
-    const rawId = extractRawId(postUri);
-    if (rawId) {
-      for (const [key, count] of postRepostCountMap.entries()) {
-        if (extractRawId(key) === rawId) {
-          offset = count;
-          break;
-        }
-      }
-    }
-  }
-  return Math.max(0, baseCount + offset);
+async function getPostRepostCount(postUri: string): Promise<number> {
+  if (!postUri) return 0;
+  const rawId = extractRawId(postUri);
+  if (!rawId) return 0;
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) as cnt FROM post_engagements WHERE subject_raw_id = $1 AND kind = 'repost'`,
+    [rawId]
+  );
+  return parseInt(rows[0]?.cnt || "0", 10);
 }
 
+// Reply counts were already durable (local_cache_posts, queried fresh via
+// dbCountsMap by every caller) — the in-memory postReplyCountMap offset
+// this used to also add was pure double-counting: a freshly-created
+// reply's row already exists (and is already marked synced — see
+// POST /at/reply) by the time dbCountsMap's query runs, so it was being
+// counted once for real and once again from memory.
 function getPostReplyCount(postUri: string, baseCount: number, dbCountsMap?: Map<string, number>): number {
-  const inMemoryOffset = postReplyCountMap.get(postUri) || 0;
   const dbCount = dbCountsMap ? (dbCountsMap.get(postUri) || 0) : 0;
-  return Math.max(0, baseCount + inMemoryOffset + dbCount);
+  return Math.max(0, baseCount + dbCount);
 }
 
-function mapToUnifiedFeedItem(item: any, viewerWebId?: string, dbCountsMap?: Map<string, number>): any {
+/**
+ * Adds or removes a durable like/repost. ON CONFLICT DO NOTHING makes
+ * "like" idempotent the same way the old Set-based in-memory version was.
+ */
+async function setEngagement(actorUri: string, subjectUri: string, kind: "like" | "repost", present: boolean): Promise<void> {
+  const rawId = extractRawId(subjectUri);
+  if (!rawId) return;
+  if (present) {
+    await pool.query(
+      `INSERT INTO post_engagements (actor_uri, subject_uri, subject_raw_id, kind)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (actor_uri, subject_raw_id, kind) DO NOTHING`,
+      [actorUri, subjectUri, rawId, kind]
+    );
+  } else {
+    await pool.query(
+      `DELETE FROM post_engagements WHERE actor_uri = $1 AND subject_raw_id = $2 AND kind = $3`,
+      [actorUri, rawId, kind]
+    );
+  }
+}
+
+async function mapToUnifiedFeedItem(item: any, viewerWebId?: string, dbCountsMap?: Map<string, number>): Promise<any> {
   const isAtProto = item.id.startsWith("at://");
   
   let hasMedia = false;
@@ -243,13 +255,16 @@ function mapToUnifiedFeedItem(item: any, viewerWebId?: string, dbCountsMap?: Map
     }
   }
 
-  const baseLikeCount = item.engagement?.likeCount || 0;
-  const finalLikeCount = getPostLikeCount(item.id, baseLikeCount);
   const baseReplyCount = item.engagement?.replyCount || 0;
+  const [finalLikeCount, finalRepostCount, viewerHasLikedDb, viewerHasRepostedDb] = await Promise.all([
+    getPostLikeCount(item.id),
+    getPostRepostCount(item.id),
+    isPostLikedByUser(viewerWebId, item.id),
+    isPostRepostedByUser(viewerWebId, item.id)
+  ]);
   const finalReplyCount = getPostReplyCount(item.id, baseReplyCount, dbCountsMap);
-  const viewerHasLiked = isPostLikedByUser(viewerWebId, item.id) || !!item.engagement?.viewerHasLiked;
-  const finalRepostCount = getPostRepostCount(item.id, item.engagement?.shareCount || 0);
-  const viewerHasReposted = isPostRepostedByUser(viewerWebId, item.id) || (item.engagement?.viewerHasReposted ?? false);
+  const viewerHasLiked = viewerHasLikedDb || !!item.engagement?.viewerHasLiked;
+  const viewerHasReposted = viewerHasRepostedDb || (item.engagement?.viewerHasReposted ?? false);
 
   return {
     id: numericId,
@@ -537,7 +552,7 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
         if (query.source === "atproto" && !presence.includes("at")) continue;
         if (query.source === "activitypods" && !presence.includes("ap")) continue;
 
-        const mapped = mapToUnifiedFeedItem(item, webId, dbReplyCountsMap);
+        const mapped = await mapToUnifiedFeedItem(item, webId, dbReplyCountsMap);
         // Exclude direct replies from the top-level timeline feed
         if (mapped.replyParentUri || (item as any).replyToStableId) continue;
 
@@ -555,14 +570,21 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
            ORDER BY created_at DESC`
         );
         
-        const rawUnsynced = rows.map((row: any) => {
+        const rawUnsynced = await Promise.all(rows.map(async (row: any) => {
           const authorName = row.actor_uri.split("/").pop() || "user";
           const objectUri = `${activityPodsUrl}/${authorName}/data/${row.post_type === "article" ? "article" : "note"}/${row.id}`;
           const isAtProtoOnly = row.target_protocol === "atproto";
           const itemSource = isAtProtoOnly ? "atproto" : "activitypods";
           const atUri = `at://did:plc:${authorName}/app.bsky.feed.post/${row.id.replace(/-/g, '')}`;
           const postId = isAtProtoOnly ? atUri : objectUri;
-          
+
+          const [likeCount, repostCount, viewerHasLiked, viewerHasReposted] = await Promise.all([
+            getPostLikeCount(postId),
+            getPostRepostCount(postId),
+            isPostLikedByUser(webId, postId),
+            isPostRepostedByUser(webId, postId)
+          ]);
+
           return {
             id: postId,
             content: row.content,
@@ -586,13 +608,13 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
             protocolPresence: isAtProtoOnly ? ["at"] : (row.target_protocol === "activitypods" ? ["ap"] : ["ap", "at"]),
             hashtags: row.hashtags || [],
             attachments: Array.isArray(row.attachments) ? row.attachments : [],
-            likeCount: getPostLikeCount(postId, 0),
+            likeCount,
             replyCount: getPostReplyCount(postId, 0, dbReplyCountsMap),
-            repostCount: getPostRepostCount(postId, 0),
-            viewerHasLiked: isPostLikedByUser(webId, postId),
-            viewerHasReposted: isPostRepostedByUser(webId, postId)
+            repostCount,
+            viewerHasLiked,
+            viewerHasReposted
           };
-        });
+        }));
 
         // Filter unsynced items based on hashtag / source query
         unsyncedItems = rawUnsynced.filter((item: any) => {
@@ -700,7 +722,7 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       let rootStableId = rootUri;
 
       if (rootHydrateRes.items && rootHydrateRes.items[0]) {
-        rootItemMapped = mapToUnifiedFeedItem(rootHydrateRes.items[0], webId);
+        rootItemMapped = await mapToUnifiedFeedItem(rootHydrateRes.items[0], webId);
         rootStableId = rootHydrateRes.items[0].id || rootUri;
       } else {
         // Fallback: Query local_cache_posts for root item
@@ -720,6 +742,10 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
             const atUri = `at://did:plc:${authorName}/app.bsky.feed.post/${row.id.replace(/-/g, '')}`;
             const postId = isAtProtoOnly ? atUri : objectUri;
             rootStableId = objectUri;
+            const [rootLikeCount, rootViewerHasLiked] = await Promise.all([
+              getPostLikeCount(postId),
+              isPostLikedByUser(webId, postId)
+            ]);
             rootItemMapped = {
               id: stringToNumericId(postId),
               content: row.content,
@@ -743,9 +769,9 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
               protocolPresence: isAtProtoOnly ? ["at"] : (row.target_protocol === "activitypods" ? ["ap"] : ["ap", "at"]),
               hashtags: row.hashtags || [],
               attachments: Array.isArray(row.attachments) ? row.attachments : [],
-              likeCount: getPostLikeCount(postId, 0),
+              likeCount: rootLikeCount,
               replyCount: getPostReplyCount(postId, 0),
-              viewerHasLiked: isPostLikedByUser(webId, postId)
+              viewerHasLiked: rootViewerHasLiked
             };
           }
         } catch (err) {
@@ -772,7 +798,7 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
             shape: "card"
           });
 
-          mappedReplies.push(...hydratedReplies.items.map(r => mapToUnifiedFeedItem(r, webId)));
+          mappedReplies.push(...(await Promise.all(hydratedReplies.items.map(r => mapToUnifiedFeedItem(r, webId)))));
         }
       } catch (err) {
         console.warn("Failed to query vector replies:", err);
@@ -805,6 +831,11 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
           const atUri = `at://did:plc:${authorName}/app.bsky.feed.post/${row.id.replace(/-/g, '')}`;
           const postId = isAtProtoOnly ? atUri : objectUri;
 
+          const [replyLikeCount, replyViewerHasLiked] = await Promise.all([
+            getPostLikeCount(postId),
+            isPostLikedByUser(webId, postId)
+          ]);
+
           mappedReplies.push({
             id: stringToNumericId(postId),
             content: row.content,
@@ -825,8 +856,8 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
             replyParentUri: row.in_reply_to,
             replyRootUri: row.in_reply_to,
             type: "post",
-            likeCount: getPostLikeCount(postId, 0),
-            viewerHasLiked: isPostLikedByUser(webId, postId)
+            likeCount: replyLikeCount,
+            viewerHasLiked: replyViewerHasLiked
           });
         }
       } catch (dbErr) {
@@ -917,13 +948,8 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       return;
     }
 
-    // Maintain in-memory repost state
-    if (!userRepostsMap.has(webId)) {
-      userRepostsMap.set(webId, new Set());
-    }
-    userRepostsMap.get(webId)!.add(subjectUri);
-    const currentCount = postRepostCountMap.get(subjectUri) || 0;
-    postRepostCountMap.set(subjectUri, currentCount + 1);
+    // Durable repost state (see post_engagements in db/postgres.ts)
+    await setEngagement(webId, subjectUri, "repost", true);
 
     const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
     const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
@@ -1048,12 +1074,8 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       return;
     }
 
-    // Maintain in-memory repost state
-    if (userRepostsMap.has(webId)) {
-      userRepostsMap.get(webId)!.delete(subjectUri);
-    }
-    const currentCount = postRepostCountMap.get(subjectUri) || 0;
-    postRepostCountMap.set(subjectUri, Math.max(0, currentCount - 1));
+    // Durable repost state (see post_engagements in db/postgres.ts)
+    await setEngagement(webId, subjectUri, "repost", false);
 
     let repostUri = body.repostUri;
     if (!repostUri) {
@@ -1393,16 +1415,8 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       return;
     }
 
-    // Record like in local in-memory state
-    if (!userLikesMap.has(authedWebId)) {
-      userLikesMap.set(authedWebId, new Set());
-    }
-    const userSet = userLikesMap.get(authedWebId)!;
-    if (!userSet.has(postUri)) {
-      userSet.add(postUri);
-      const currentOffset = postLikeCountMap.get(postUri) || 0;
-      postLikeCountMap.set(postUri, currentOffset + 1);
-    }
+    // Durable like state (see post_engagements in db/postgres.ts)
+    await setEngagement(authedWebId, postUri, "like", true);
 
     const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
     const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
@@ -1513,13 +1527,8 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       return;
     }
 
-    // Remove like from local state
-    const userSet = userLikesMap.get(authedWebId);
-    if (userSet && userSet.has(postUri)) {
-      userSet.delete(postUri);
-      const currentOffset = postLikeCountMap.get(postUri) || 0;
-      postLikeCountMap.set(postUri, Math.max(-10, currentOffset - 1));
-    }
+    // Durable like state (see post_engagements in db/postgres.ts)
+    await setEngagement(authedWebId, postUri, "like", false);
 
     const activityPodsUrl = (process.env["ACTIVITYPODS_URL"] || "http://activitypods:3000").replace(/\/$/, "");
     const activityPodsToken = process.env["ACTIVITYPODS_TOKEN"] || "";
@@ -1614,9 +1623,12 @@ export function registerPublicFeedRoutes(app: FastifyInstance, deps: PublicFeedR
       const username = actorUri.split("/").pop() || "user";
       const replyNoteId = `${activityPodsUrl}/${username}/data/note/${replyId}`;
 
-      // Increment parent reply count in local state
-      const currentOffset = postReplyCountMap.get(parentUri) || 0;
-      postReplyCountMap.set(parentUri, currentOffset + 1);
+      // No manual reply-count bump needed here — the row inserted just
+      // below is what dbReplyCountsMap's live SQL COUNT already reflects
+      // on every /at/feed call. There used to be a redundant in-memory
+      // postReplyCountMap increment right here too, which double-counted
+      // every reply: once for real via that query, once again from a Map
+      // that could never agree with it after a restart anyway.
 
       // Save reply to local_cache_posts purely so GET /at/feed's reply-count
       // / thread queries can see it — actual delivery happens synchronously
